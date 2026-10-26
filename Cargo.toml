@@ -1,0 +1,16 @@
+[package]
+name = "yruler"
+version = "0.1.0"
+edition = "2021"
+description = "Measure the human Y chromosome satellite arrays from sequencing reads"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1

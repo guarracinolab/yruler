@@ -1,0 +1,7 @@
+# yruler model: length_bp = K * sum_gc(class) / sum(ysinglecopy)
+# markers: training set (k=31 canonical); dyz3 6,721, yq12 672,021, ysinglecopy 6,940,206, chr2depth 8,965,587
+# K fitted on training truth males (Hallast clean arrays + HPRC R2 where Hallast is not clean): dyz3 97, yq12 69
+# holdout median |error|: dyz3 2.65% (22 males), yq12 1.09% (15 males); 1kGP 30x, GRCh38, DRAGEN 3.7.6 regions
+class	K
+dyz3	11058551.657505095
+yq12	8466176.518121855
