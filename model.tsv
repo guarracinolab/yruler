@@ -1,4 +1,4 @@
-# length_bp = K * sum_gc(class) / sum(ysinglecopy)
-class	K
-dyz3	11058551.657505095
-yq12	8466176.518121855
+# length_bp = K * sum_gc(class) / sum(ysinglecopy); K per technology (-x)
+class	K	tech
+dyz3	11058551.657505095	illumina
+yq12	8466176.518121855	illumina

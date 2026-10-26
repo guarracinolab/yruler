@@ -10,7 +10,8 @@ use std::time::Instant;
 const K: usize = 31;
 const MASK: u64 = (1u64 << 62) - 1;
 const EMPTY: u64 = u64::MAX;
-const CHUNK: usize = 8 << 20;
+static CHUNK_SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn chunk() -> usize { *CHUNK_SZ.get_or_init(|| std::env::var("YRULER_CHUNK_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2) << 20) }   // read chunk bytes (2 MB: same speed as 8 to 64, least RSS)
 
 static LUT: [u8; 256] = {
     let mut t = [4u8; 256];
@@ -24,6 +25,8 @@ static LUT: [u8; 256] = {
 fn hk(x: u64) -> u64 { let m = x.wrapping_mul(0x9e3779b97f4a7c15); m ^ (m >> 29) }   // k-mer hash: one multiply, high bits folded down
 
 fn die(m: &str) -> ! { eprintln!("ERROR yruler: {m}"); std::process::exit(1) }
+// resident and peak memory from /proc (Linux), for the stage log
+fn rss() -> String { std::fs::read_to_string("/proc/self/status").map_or("rss n/a".into(), |t| t.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("VmHWM")).map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" ")) }
 
 // word Bloom filter, checked only on k-mer cache misses: 4 bits in one 64-bit word per key (one load, one AND)
 struct Bloom { b: Vec<u64>, mask: u64 }
@@ -95,49 +98,54 @@ fn decode(x: u64) -> [u8; K] { let mut o = [0u8; K]; for i in 0..K { o[i] = b"AC
 struct Markers { key: Vec<u64>, order: Vec<u32>, ocls: Vec<u8>, gc: Vec<u8>, names: Vec<String>, tab: Table }
 // class name of a header line: text before the first '_' (trailing whitespace trimmed first)
 fn hname(h: &[u8]) -> &[u8] { let mut e = h.len(); while e > 0 && h[e - 1].is_ascii_whitespace() { e -= 1; } let h = &h[..e]; &h[..h.iter().position(|&b| b == b'_').unwrap_or(h.len())] }
-// file cut at line ends into thr pieces parsed in parallel, then keys inserted in file order (first occurrence = index)
-// masked superstring: uppercase base = a k-mer starts there
-fn expand_ms(raw: &[u8]) -> Vec<u8> {
-    let mut o = Vec::with_capacity(raw.len() * 33); let mut seq: Vec<u8> = vec![]; let mut hd: &[u8] = b"";
-    let flush = |hd: &[u8], seq: &mut Vec<u8>, o: &mut Vec<u8>| { if hd.is_empty() { if !seq.is_empty() { die("sequence before the first header"); } return; }
-        o.push(b'>'); o.extend_from_slice(hname(hd)); o.push(b'\n');
-        for i in 0..(seq.len() + 1).saturating_sub(K) { if seq[i].is_ascii_uppercase() { o.extend(seq[i..i + K].iter().map(|b| b.to_ascii_uppercase())); o.push(b'\n'); } }
-        seq.clear(); };
-    for l in raw.split(|&b| b == b'\n') { let l = l.strip_suffix(b"\r").unwrap_or(l); if l.first() == Some(&b'>') { flush(hd, &mut seq, &mut o); hd = &l[1..]; } else { seq.extend_from_slice(l); } }
-    flush(hd, &mut seq, &mut o); o
+// masked superstring records (class name, sequence): uppercase base = a k-mer starts there
+fn ms_records(raw: &[u8]) -> Vec<(&[u8], Vec<u8>)> {
+    let mut r: Vec<(&[u8], Vec<u8>)> = vec![];
+    for l in raw.split(|&b| b == b'\n') { let l = l.strip_suffix(b"\r").unwrap_or(l); if l.first() == Some(&b'>') { r.push((hname(&l[1..]), vec![])); } else if let Some(x) = r.last_mut() { x.1.extend_from_slice(l); } else if !l.is_empty() { die("sequence before the first header"); } }
+    r
 }
+type Part<'a> = (Vec<(u64, u8, u8)>, Vec<&'a [u8]>);   // (key, G+C, local header index or 255), header names
+fn gcn(w: &[u8]) -> u8 { w.iter().filter(|&&b| matches!(b, b'G' | b'C' | b'g' | b'c')).count() as u8 }
+// k-mers in file order, parsed in parallel pieces; first occurrence = marker index
 fn load(path: &str, thr: usize) -> Markers {
     let raw = std::fs::read(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
     let raw = if path.ends_with(".zst") { zstd::stream::decode_all(&raw[..]).unwrap_or_else(|e| die(&format!("{path}: zstd {e}"))) } else { raw };
     // one k-mer per line, else masked superstring
     let ms = raw.split(|&b| b == b'\n').find(|l| !l.is_empty() && l[0] != b'>').map_or(false, |l| { let l = l.strip_suffix(b"\r").unwrap_or(l); l.len() != K || l.iter().any(|b| b.is_ascii_lowercase()) });
-    let raw = if ms { let t = Instant::now(); let e = expand_ms(&raw); eprintln!("markers: masked superstring {} bytes expanded to {} bytes in {:.1} s", raw.len(), e.len(), t.elapsed().as_secs_f64()); e } else { raw };
-    let n = raw.len();
-    let mut cuts = vec![0usize]; for t in 1..thr { let mut p = (n * t / thr).max(*cuts.last().unwrap()); while p < n && p > 0 && raw[p - 1] != b'\n' { p += 1; } cuts.push(p); } cuts.push(n);
-    // per piece: (key, hash, G+C, local header index or 255 = before the first header of the piece), header names in order
-    let parts: Vec<(Vec<(u64, u64, u8, u8)>, Vec<&[u8]>)> = std::thread::scope(|sc| {
-        let hs: Vec<_> = cuts.windows(2).map(|w| { let raw = &raw[w[0]..w[1]]; sc.spawn(move || {
-            let (mut v, mut nm, mut cur): (Vec<(u64, u64, u8, u8)>, Vec<&[u8]>, u8) = (Vec::with_capacity(raw.len() / 64 + 16), vec![], 255);
-            for l in raw.split(|&b| b == b'\n') {
-                if l.is_empty() { continue; }
-                if l[0] == b'>' { let c = hname(&l[1..]); if nm.last() != Some(&c) { if nm.len() == 254 { die("more than 254 header names in one piece"); } nm.push(c); } cur = (nm.len() - 1) as u8; continue; }
-                let l = l.strip_suffix(b"\r").unwrap_or(l);
-                let x = canon(l).unwrap_or_else(|| die(&format!("marker line of length {} or non-ACGT", l.len())));
-                v.push((x, hk(x), l.iter().filter(|&&b| matches!(b, b'G' | b'C' | b'g' | b'c')).count() as u8, cur));
-            }
-            (v, nm) }) }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let recs = if ms { ms_records(&raw) } else { vec![] };
+    let parts: Vec<Part> = if ms {   // record pieces of about starts/thr k-mer starts
+        let ns: usize = recs.iter().map(|r| (r.1.len() + 1).saturating_sub(K)).sum(); let per = (ns / thr).max(1 << 16);
+        let tasks: Vec<(usize, usize, usize)> = recs.iter().enumerate().flat_map(|(ri, r)| { let n = (r.1.len() + 1).saturating_sub(K); (0..n).step_by(per).map(move |a| (ri, a, (a + per).min(n))) }).collect();
+        let p: Vec<Part> = std::thread::scope(|sc| { let recs = &recs; let hs: Vec<_> = tasks.iter().map(|&(ri, a, b)| sc.spawn(move || { let s = &recs[ri].1; let mut v = Vec::with_capacity((b - a) / 2);
+            for i in a..b { if s[i].is_ascii_uppercase() { let w = &s[i..i + K]; v.push((canon(w).unwrap_or_else(|| die("masked superstring k-mer with non-ACGT")), gcn(w), 0)); } }
+            (v, vec![recs[ri].0]) })).collect(); hs.into_iter().map(|h| h.join().unwrap()).collect() });
+        eprintln!("markers: masked superstring {} bytes, {} records, {} k-mer starts, {} pieces", raw.len(), recs.len(), ns, tasks.len()); p
+    } else {   // file cut at line ends into thr pieces
+        let n = raw.len();
+        let mut cuts = vec![0usize]; for t in 1..thr { let mut p = (n * t / thr).max(*cuts.last().unwrap()); while p < n && p > 0 && raw[p - 1] != b'\n' { p += 1; } cuts.push(p); } cuts.push(n);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = cuts.windows(2).map(|w| { let raw = &raw[w[0]..w[1]]; sc.spawn(move || {
+                let (mut v, mut nm, mut cur): (Vec<(u64, u8, u8)>, Vec<&[u8]>, u8) = (Vec::with_capacity(raw.len() / 64 + 16), vec![], 255);
+                for l in raw.split(|&b| b == b'\n') {
+                    if l.is_empty() { continue; }
+                    if l[0] == b'>' { let c = hname(&l[1..]); if nm.last() != Some(&c) { if nm.len() == 254 { die("more than 254 header names in one piece"); } nm.push(c); } cur = (nm.len() - 1) as u8; continue; }
+                    let l = l.strip_suffix(b"\r").unwrap_or(l);
+                    v.push((canon(l).unwrap_or_else(|| die(&format!("marker line of length {} or non-ACGT", l.len()))), gcn(l), cur));
+                }
+                (v, nm) }) }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
     let mut names: Vec<String> = vec![]; let mut cur = usize::MAX; let tot: usize = parts.iter().map(|p| p.0.len()).sum();
     if tot >= u32::MAX as usize { die("more than 2^32 - 1 markers"); }
     let mut tab = Table::new(tot, thr); let (mut key, mut order, mut ocls, mut gc) = (vec![], Vec::with_capacity(tot), Vec::with_capacity(tot), Vec::with_capacity(tot));
     for (v, nm) in &parts {
         let gl: Vec<usize> = nm.iter().map(|c| { let c = String::from_utf8_lossy(c).to_string(); names.iter().position(|x| *x == c).unwrap_or_else(|| { names.push(c); names.len() - 1 }) }).collect();
         if names.len() > 16 { die("more than 16 classes"); }
-        for (k, &(x, h, g, lc)) in v.iter().enumerate() {
+        for (k, &(x, g, lc)) in v.iter().enumerate() {
             if lc != 255 { cur = gl[lc as usize]; } else if cur == usize::MAX { die("sequence before the first header"); }
-            if let Some(nx) = v.get(k + 16) { prefetch(tab.at(nx.1)); }
-            let (i, new) = tab.insert(x, h, key.len() as u32, cur); if new { key.push(x); }
+            if let Some(nx) = v.get(k + 16) { prefetch(tab.at(hk(nx.0))); }
+            let (i, new) = tab.insert(x, hk(x), key.len() as u32, cur); if new { key.push(x); }
             order.push(i); ocls.push(cur as u8); gc.push(g);
         }
         if let Some(&c) = gl.last() { cur = c; }
@@ -145,8 +153,8 @@ fn load(path: &str, thr: usize) -> Markers {
     Markers { key, order, ocls, gc, names, tab }
 }
 
-// per-thread bin record: reads, reads MAPQ >= 20, duplicates, then per class hits, hits MAPQ >= 20, reads with a hit
-struct Local { contigs: HashMap<Vec<u8>, u32>, cname: Vec<Vec<u8>>, bins: HashMap<(u32, u64), usize>, rec: Vec<(u32, u64, Vec<u64>)>, reads: u64, kmers: u64, hits: u64, cmiss: u64, bpos: u64, cache: Vec<Ent> }
+// per-thread bin record (rk key, rv flat values): reads, reads MAPQ >= 20, duplicates, then per class hits, hits MAPQ >= 20, reads with a hit
+struct Local { contigs: HashMap<Vec<u8>, u32>, cname: Vec<Vec<u8>>, bins: HashMap<(u32, u64), usize>, rk: Vec<(u32, u64)>, rv: Vec<u64>, reads: u64, kmers: u64, hits: u64, cmiss: u64, bpos: u64, cache: Vec<Ent> }
 // per-thread cache of recent k-mers (sorted input: a k-mer comes back in the next reads); counts added to the table on eviction
 #[derive(Clone, Copy)]
 struct Ent { key: u64, sc: u32, pend: u16, cls: u16 }   // 16 bytes; sc = table slot + 1, 0 = not a marker
@@ -173,7 +181,7 @@ fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64,
     let (w, b, mq) = (3 + 3 * c.ncl, pos / c.bin, mapq >= 20);
     let ri = if c.last.1 == b && c.last.0 == rname { c.last.2 } else {
         let ci = match loc.contigs.get(rname) { Some(&x) => x, None => { let x = loc.cname.len() as u32; loc.contigs.insert(rname.to_vec(), x); loc.cname.push(rname.to_vec()); x } };
-        let ri = *loc.bins.entry((ci, b)).or_insert_with(|| { loc.rec.push((ci, b, vec![0; w])); loc.rec.len() - 1 });
+        let ri = *loc.bins.entry((ci, b)).or_insert_with(|| { loc.rk.push((ci, b)); loc.rv.resize(loc.rv.len() + w, 0); loc.rk.len() - 1 });
         c.last = (rname.to_vec(), b, ri); ri
     };
     loc.reads += 1; c.h.iter_mut().for_each(|x| *x = 0); let h = &mut c.h;
@@ -195,7 +203,7 @@ fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64,
         if e.key != x { evict(e, c.tab); *e = match if bp { loc.bpos += 1; c.tab.find(x, hx) } else { None } { Some(i) => Ent { key: x, sc: i as u32 + 1, pend: 0, cls: c.tab.cls[i] }, None => Ent { key: x, sc: 0, pend: 0, cls: 0 } }; }
         if e.sc != 0 { loc.hits += 1; hit(e, c.tab, h); }
     }
-    let rec = &mut loc.rec[ri].2;
+    let rec = &mut loc.rv[ri * w..(ri + 1) * w];
     rec[0] += 1; if mq { rec[1] += 1; } if (fl >> 10) & 1 == 1 { rec[2] += 1; }
     let mut any = false;
     for j in 0..c.ncl { if h[j] > 0 { any = true; rec[3 + 3 * j] += h[j]; if mq { rec[4 + 3 * j] += h[j]; } rec[5 + 3 * j] += 1; } }
@@ -268,9 +276,9 @@ fn spawn_reader(src: Src, tx: Tx, prx: mpsc::Receiver<Vec<u8>>, thr: usize) -> s
 fn read_stdin(tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
     let mut carry: Vec<u8> = Vec::new(); let (mut ci, mut bytes) = (0u64, 0u64);
     loop {
-        let mut buf = prx.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK + (1 << 17))); buf.clear(); buf.extend_from_slice(&carry); carry.clear();
-        let start = buf.len(); buf.reserve(CHUNK); let bp = unsafe { buf.as_mut_ptr().add(start) };   // read(2) into spare capacity
-        let mut got = 0; while got < CHUNK { let k = unsafe { libc::read(0, bp.add(got) as *mut libc::c_void, CHUNK - got) }; if k == 0 { break; } if k < 0 { let e = io::Error::last_os_error(); if e.kind() == io::ErrorKind::Interrupted { continue; } die(&format!("stdin: {e}")); } got += k as usize; }
+        let mut buf = prx.try_recv().unwrap_or_else(|_| Vec::with_capacity(chunk() + (1 << 17))); buf.clear(); buf.extend_from_slice(&carry); carry.clear();
+        let start = buf.len(); buf.reserve(chunk()); let bp = unsafe { buf.as_mut_ptr().add(start) };   // read(2) into spare capacity
+        let mut got = 0; while got < chunk() { let k = unsafe { libc::read(0, bp.add(got) as *mut libc::c_void, chunk() - got) }; if k == 0 { break; } if k < 0 { let e = io::Error::last_os_error(); if e.kind() == io::ErrorKind::Interrupted { continue; } die(&format!("stdin: {e}")); } got += k as usize; }
         unsafe { buf.set_len(start + got); } bytes += got as u64;
         if got == 0 { if !buf.is_empty() { tx.send((ci, buf)).unwrap(); } break; }
         if let Some(p) = buf.iter().rposition(|&b| b == b'\n') { carry.extend_from_slice(&buf[p + 1..]); buf.truncate(p + 1); }
@@ -295,7 +303,7 @@ fn regions(bed: &str, names: &[Vec<u8>]) -> Vec<(u32, i64, i64)> {
 fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
     use rust_htslib::bam::{self, Read};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
-    let open = |t: usize| { let mut r = bam::IndexedReader::from_path(input).unwrap_or_else(|e| die(&format!("{input}: {e}")));
+    let open = |t: usize| { let mut r = if input.contains("://") { bam::IndexedReader::from_url(&input.parse().unwrap_or_else(|e| die(&format!("{input}: {e}")))) } else { bam::IndexedReader::from_path(input) }.unwrap_or_else(|e| die(&format!("{input}: {e}")));
         if let Some(f) = reference { r.set_reference(f).unwrap_or_else(|e| die(&format!("reference {f}: {e}"))); }
         r.set_threads(t.max(1)).unwrap_or_else(|e| die(&format!("threads: {e}")));
         if let Err(e) = r.set_cram_options(rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200) { eprintln!("WARNING cram required fields: {e}"); }
@@ -310,7 +318,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
     let (next, ci, nrec, prx) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicU64::new(0), Mutex::new(prx));
     std::thread::scope(|sc| for _ in 0..nr { sc.spawn(|| {
         let mut r = open(thr / nr); let mut rec = bam::Record::new(); let mut n = 0u64;
-        let newbuf = || prx.lock().unwrap().try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK + (1 << 17)));
+        let newbuf = || prx.lock().unwrap().try_recv().unwrap_or_else(|_| Vec::with_capacity(chunk() + (1 << 17)));
         let mut buf = newbuf(); buf.clear();
         loop {
             let i = next.fetch_add(1, Relaxed); if i >= sh.len() { break; }
@@ -322,7 +330,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
                 if buf.is_empty() { buf.push(0xFF); }   // binary record: flag u16, tid i32, pos i64, mapq u8, l_seq u32, 4-bit seq
                 let l = rec.seq_len(); buf.extend_from_slice(&fl.to_le_bytes()); buf.extend_from_slice(&rec.tid().to_le_bytes()); buf.extend_from_slice(&p.to_le_bytes()); buf.push(rec.mapq()); buf.extend_from_slice(&(l as u32).to_le_bytes());
                 buf.extend_from_slice(&rec.seq().encoded[..(l + 1) / 2]); n += 1;
-                if buf.len() >= CHUNK { let mut b = newbuf(); b.clear(); tx.send((ci.fetch_add(1, Relaxed), std::mem::replace(&mut buf, b))).unwrap(); }
+                if buf.len() >= chunk() { let mut b = newbuf(); b.clear(); tx.send((ci.fetch_add(1, Relaxed), std::mem::replace(&mut buf, b))).unwrap(); }
             }
         }
         if buf.len() > 1 { tx.send((ci.fetch_add(1, Relaxed), buf)).unwrap(); }
@@ -334,13 +342,14 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
 fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
     let t0 = Instant::now();
     // reader: stdin read during the marker load (up to 64 chunks of 8 MB queued), chunks cut at line ends
-    let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>((thr * 2).max(64)); let rx = Arc::new(Mutex::new(rx));
+    let q: usize = std::env::var("YRULER_QUEUE").ok().and_then(|v| v.parse().ok()).unwrap_or(32); eprintln!("queue {q} chunks of {} MB", chunk() >> 20);
+    let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(q); let rx = Arc::new(Mutex::new(rx));
     let (ptx, prx) = mpsc::channel::<Vec<u8>>();   // used chunk buffers back to the reader (no new pages per chunk)
     let reader = spawn_reader(src, tx, prx, thr);
     let mut mk = load(fa_path, thr); let ncl = mk.names.len(); let n = mk.key.len();
     let per: Vec<usize> = (0..ncl).map(|j| mk.ocls.iter().filter(|&&c| c as usize == j).count()).collect();
     let tab = std::mem::replace(&mut mk.tab, Table { s: Vec::new(), cls: Vec::new(), mask: 0 });
-    eprintln!("markers lines {} distinct {} classes {:?} per class {:?}; table {} MB; load {:.1} s", mk.order.len(), n, mk.names, per, (tab.s.len() * 16) >> 20, t0.elapsed().as_secs_f64());
+    eprintln!("markers lines {} distinct {} classes {:?} per class {:?}; table {} MB; load {:.1} s; {}", mk.order.len(), n, mk.names, per, (tab.s.len() * 16) >> 20, t0.elapsed().as_secs_f64(), rss());
     let bpk: usize = std::env::var("YRULER_BLOOM_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);   // Bloom bits per key
     let bloom = { let mut b = Bloom::new(n, bpk.max(1)); for &x in &mk.key { b.insert(hk(x)); } Arc::new(b) };
     eprintln!("bloom {} MB ({} bits/key)", bloom.b.len() * 8 >> 20, bpk.max(1));
@@ -356,7 +365,7 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
     let workers: Vec<_> = (0..thr).map(|_| {
         let (rx, ftx, ptx, tab, bloom) = (rx.clone(), ftx.clone(), ptx.clone(), tab.clone(), bloom.clone());
         std::thread::Builder::new().name("yr-count".into()).spawn(move || {
-            let mut loc = Local { contigs: HashMap::new(), cname: vec![], bins: HashMap::new(), rec: vec![], reads: 0, kmers: 0, hits: 0, cmiss: 0, bpos: 0, cache: vec![Ent { key: EMPTY, sc: 0, pend: 0, cls: 0 }; 1 << cb] }; let mut kb: Vec<(u64, u64, bool)> = Vec::with_capacity(1024); let mut sq: Vec<u8> = Vec::with_capacity(1 << 16); let mut cx = Ctx { bloom: &bloom, tab: &tab, ncl, bin, h: vec![0; ncl], last: (Vec::new(), u64::MAX, 0) };
+            let mut loc = Local { contigs: HashMap::new(), cname: vec![], bins: HashMap::new(), rk: vec![], rv: vec![], reads: 0, kmers: 0, hits: 0, cmiss: 0, bpos: 0, cache: vec![Ent { key: EMPTY, sc: 0, pend: 0, cls: 0 }; 1 << cb] }; let mut kb: Vec<(u64, u64, bool)> = Vec::with_capacity(1024); let mut sq: Vec<u8> = Vec::with_capacity(1 << 16); let mut cx = Ctx { bloom: &bloom, tab: &tab, ncl, bin, h: vec![0; ncl], last: (Vec::new(), u64::MAX, 0) };
             loop {
                 let c = { let r = rx.lock().unwrap(); r.recv() };
                 let Ok((ci, c)) = c else { break };
@@ -365,46 +374,61 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
                 ftx.send((ci, fa)).unwrap(); let _ = ptx.send(c);   // fails only after the reader ended: buffer then freed
             }
             for e in &loc.cache { evict(e, &tab); }
-            loc
+            loc.bins = HashMap::new(); loc.cache = vec![]; loc   // lookup maps not needed after counting
         })
     }).collect();
     drop(ftx);
     let bytes_in = reader.join().unwrap();
     let locs: Vec<Local> = workers.into_iter().map(|w| w.unwrap().join().unwrap()).collect();
     writer.join().unwrap();
-    let t_count = t0.elapsed().as_secs_f64();
+    let t_count = t0.elapsed().as_secs_f64(); eprintln!("counting done; {}", rss());
     let tp = Instant::now(); let lap = |w: &str| eprintln!("post {w} at {:.2} s", tp.elapsed().as_secs_f64());
-    // merge bins
-    let w = 3 + 3 * ncl; let mut bins: HashMap<(Vec<u8>, u64), Vec<u64>> = HashMap::new();
+    // bins: global contig ids, rows sorted by (contig name, bin); worker rows summed while writing (no merged copy)
+    let w = 3 + 3 * ncl; let (mut gname, mut gid): (Vec<Vec<u8>>, HashMap<Vec<u8>, u32>) = (vec![], HashMap::new());
     let (mut reads, mut kmers, mut hits, mut cmiss, mut bpos) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    for l in &locs {
+    let mut ord: Vec<(u32, u64, u32, u32)> = Vec::with_capacity(locs.iter().map(|l| l.rk.len()).sum());   // (contig, bin, worker, row)
+    for (wi, l) in locs.iter().enumerate() {
         reads += l.reads; kmers += l.kmers; cmiss += l.cmiss; bpos += l.bpos; hits += l.hits;
-        for (ci, b, v) in &l.rec { let e = bins.entry((l.cname[*ci as usize].clone(), *b)).or_insert_with(|| vec![0; w]); for (x, y) in e.iter_mut().zip(v) { *x += y; } }
+        let g: Vec<u32> = l.cname.iter().map(|c| *gid.entry(c.clone()).or_insert_with(|| { gname.push(c.clone()); gname.len() as u32 - 1 })).collect();
+        for (r, &(ci, b)) in l.rk.iter().enumerate() { ord.push((g[ci as usize], b, wi as u32, r as u32)); }
     }
     if reads == 0 { die("0 reads"); }
-    eprintln!("bin records over workers {} (merged {})", locs.iter().map(|l| l.rec.len()).sum::<usize>(), bins.len());
-    eprintln!("reads {reads} bins {} bytes {} k-mers {kmers} cache misses {cmiss} ({:.2}%) bloom positives {bpos} hits {hits}; counting {:.1} s", bins.len(), bytes_in, 100.0 * cmiss as f64 / kmers.max(1) as f64, t_count);
+    let mut rank = vec![0u32; gname.len()]; { let mut o: Vec<usize> = (0..gname.len()).collect(); o.sort_by(|&a, &b| gname[a].cmp(&gname[b])); for (r, &i) in o.iter().enumerate() { rank[i] = r as u32; } }
+    ord.sort_unstable_by_key(|&(c, b, wi, r)| (rank[c as usize], b, wi, r));
+    let nb = ord.len() - ord.windows(2).filter(|p| p[0].0 == p[1].0 && p[0].1 == p[1].1).count();
+    eprintln!("bin records over workers {} (merged {nb}); {}", ord.len(), rss());
+    eprintln!("reads {reads} bins {nb} bytes {} k-mers {kmers} cache misses {cmiss} ({:.2}%) bloom positives {bpos} hits {hits}; counting {:.1} s", bytes_in, 100.0 * cmiss as f64 / kmers.max(1) as f64, t_count);
     lap("bins merged");
     let mut cnt: Vec<u64> = vec![0; n]; for sl in tab.s.iter() { if sl.key != EMPTY { cnt[sl.idx as usize] = sl.cnt.load(Relaxed) as u64; } }
+    drop(tab); drop(bloom);   // counts extracted: table and filter freed
     // per class lists in marker order
     let mut cv: Vec<Vec<u64>> = vec![vec![]; ncl]; let mut gv: Vec<Vec<u8>> = vec![vec![]; ncl];
     for (k, &i) in mk.order.iter().enumerate() { let c = mk.ocls[k] as usize; cv[c].push(cnt[i as usize]); gv[c].push(mk.gc[k]); }
     // check: bins hits = counts per class
-    for j in 0..ncl { let s: u64 = cv[j].iter().sum(); let bh: u64 = bins.values().map(|v| v[3 + 3 * j]).sum(); eprintln!("check {} counts {s} bins {bh}", mk.names[j]); if s != bh { die(&format!("{} bins hits {bh} vs counts {s}", mk.names[j])); } }
+    for j in 0..ncl { let s: u64 = cv[j].iter().sum(); let bh: u64 = locs.iter().map(|l| l.rv.iter().skip(3 + 3 * j).step_by(w).sum::<u64>()).sum(); eprintln!("check {} counts {s} bins {bh}", mk.names[j]); if s != bh { die(&format!("{} bins hits {bh} vs counts {s}", mk.names[j])); } }
     let wr = |p: &str| BufWriter::with_capacity(1 << 22, std::fs::File::create(format!("{out}/{p}")).unwrap_or_else(|e| die(&format!("{p}: {e}"))));
     let t1 = Instant::now();
-    { // counts.tsv: text built in parallel blocks, written in order
-        let per = n.div_ceil(thr).max(1); let (key, cnt) = (&mk.key, &cnt);
-        let parts: Vec<Vec<u8>> = std::thread::scope(|sc| { let hs: Vec<_> = (0..n.div_ceil(per)).map(|t| sc.spawn(move || { let mut b = Vec::with_capacity(per * 40); for i in t * per..((t + 1) * per).min(n) { b.extend_from_slice(&decode(key[i])); b.push(b'\t'); b.extend_from_slice(cnt[i].to_string().as_bytes()); b.push(b'\n'); } b })).collect(); hs.into_iter().map(|h| h.join().unwrap()).collect() });
-        let mut o = wr("counts.tsv"); for b in &parts { o.write_all(b).unwrap_or_else(|e| die(&format!("write counts.tsv: {e}"))); } o.flush().unwrap();
+    { // counts.tsv: rounds of thr parallel blocks (1M lines each), written in order
+        let (key, cnt, per) = (&mk.key, &cnt, 1usize << 20); let mut o = wr("counts.tsv");
+        for r0 in (0..n).step_by(per * thr) {
+            let parts: Vec<Vec<u8>> = std::thread::scope(|sc| { let hs: Vec<_> = (r0..(r0 + per * thr).min(n)).step_by(per).map(|a| sc.spawn(move || { let mut b = Vec::with_capacity(per * 40); for i in a..(a + per).min(n) { b.extend_from_slice(&decode(key[i])); b.push(b'\t'); itoa(&mut b, cnt[i]); b.push(b'\n'); } b })).collect(); hs.into_iter().map(|h| h.join().unwrap()).collect() });
+            for b in &parts { o.write_all(b).unwrap_or_else(|e| die(&format!("write counts.tsv: {e}"))); }
+        }
+        o.flush().unwrap();
     }
     eprintln!("write counts {:.2} s", t1.elapsed().as_secs_f64());
     {
-        let mut o = wr("bins.tsv"); let mut keys: Vec<_> = bins.keys().cloned().collect(); keys.sort();
+        let mut o = wr("bins.tsv"); let mut v = vec![0u64; w]; let mut b: Vec<u8> = Vec::with_capacity(1 << 20);
         write!(o, "contig\tstart\treads\treads_mq20\tduplicates").unwrap();
         for c in &mk.names { write!(o, "\t{c}_hits\t{c}_hits_mq20\t{c}_reads").unwrap(); } writeln!(o).unwrap();
-        for k in keys { let v = &bins[&k]; o.write_all(&k.0).unwrap(); write!(o, "\t{}", k.1 * bin).unwrap(); for x in v { write!(o, "\t{x}").unwrap(); } writeln!(o).unwrap(); }
-        o.flush().unwrap();
+        for (i, &(c, bn, wi, r)) in ord.iter().enumerate() {
+            let x = &locs[wi as usize].rv[r as usize * w..(r as usize + 1) * w]; for (a, y) in v.iter_mut().zip(x) { *a += y; }
+            if ord.get(i + 1).map_or(true, |n| n.0 != c || n.1 != bn) {
+                b.extend_from_slice(&gname[c as usize]); b.push(b'\t'); itoa(&mut b, bn * bin); for a in v.iter_mut() { b.push(b'\t'); itoa(&mut b, *a); *a = 0; } b.push(b'\n');
+                if b.len() >= 1 << 20 { o.write_all(&b).unwrap_or_else(|e| die(&format!("write bins.tsv: {e}"))); b.clear(); }
+            }
+        }
+        o.write_all(&b).unwrap_or_else(|e| die(&format!("write bins.tsv: {e}"))); o.flush().unwrap();
     }
     let need = ["ysinglecopy", "chr2depth"]; for c in need { if !mk.names.iter().any(|x| x == c) { die(&format!("missing class {c}")); } }
     let ix = |c: &str| mk.names.iter().position(|x| x == c).unwrap();
@@ -420,11 +444,12 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
         for (j, c) in mk.names.iter().enumerate() { let v = &cv[j]; let (_, ms) = median(v); let z = v.iter().filter(|&&x| x == 0).count(); writeln!(o, "{name}\t{reads}\t{c}\t{}\t{}\t{ms}\t{:.4}\t{:.1}", v.len(), v.iter().sum::<u64>(), z as f64 / v.len() as f64, sg[j]).unwrap(); }
         o.flush().unwrap();
     }
-    eprintln!("y_dose {:?} ysinglecopy_depth {:?} chr2depth_mean {:?}; total {:.1} s", 2.0 * xd / ad, xd, ad, t0.elapsed().as_secs_f64());
+    eprintln!("y_dose {:?} ysinglecopy_depth {:?} chr2depth_mean {:?}; total {:.1} s; {}", 2.0 * xd / ad, xd, ad, t0.elapsed().as_secs_f64(), rss());
 }
 
-// estimate: length = K * sum_gc(class) / sum(ysinglecopy)
-fn estimate(summary: &str, model: &str, o: &mut dyn Write) {
+const TECH: [&str; 5] = ["illumina", "element", "hifi", "ont", "hic"];
+// estimate: length = K * sum_gc(class) / sum(ysinglecopy), K of technology x (model column 3, empty = illumina)
+fn estimate(summary: &str, model: &str, x: &str, o: &mut dyn Write) {
     let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
     let (sm, md) = (rd(summary), rd(model));
     let mut dose = String::new(); let mut sg: Vec<(String, String, f64)> = vec![]; let mut ysum = f64::NAN;
@@ -438,48 +463,54 @@ fn estimate(summary: &str, model: &str, o: &mut dyn Write) {
     }
     if !(ysum > 0.0) { die("no ysinglecopy sum > 0 in summary"); }
     let mut k: HashMap<String, f64> = HashMap::new();
-    for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').collect(); if f.len() >= 2 && f[0] != "class" { k.insert(f[0].to_string(), f[1].parse().unwrap_or_else(|_| die(&format!("model K {}", f[1])))); } }
-    if k.is_empty() { die("model has no class rows"); }
+    for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').collect(); if f.len() >= 2 && f[0] != "class" && f.get(2).map_or("illumina", |t| t.trim()) == x { k.insert(f[0].to_string(), f[1].parse().unwrap_or_else(|_| die(&format!("model K {}", f[1])))); } }
+    if k.is_empty() { die(&format!("model {model} has no K for technology {x}")); }
+    if x == "element" || x == "hic" { eprintln!("WARNING technology {x} is experimental"); }
     writeln!(o, "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose").unwrap();
     let mut n = 0;
     for (s, c, v) in &sg { if let Some(kk) = k.get(c) { writeln!(o, "{s}\t{c}\t{:.0}\t{v:.1}\t{ysum:.0}\t{dose}", kk * v / ysum).unwrap(); n += 1; } }
     for c in k.keys() { if !sg.iter().any(|t| &t.1 == c) { die(&format!("model class {c} missing in summary")); } }
-    eprintln!("estimate classes {n} y_dose {dose}");
+    eprintln!("estimate technology {x} classes {n} y_dose {dose}");
 }
 
 const USAGE: &str = "usage:
-  yruler -i <cram|bam|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-n <name>] [-t <threads>]
-  yruler estimate <summary.tsv> <model.tsv>
--i -: SAM on stdin";
+  yruler -i <cram|bam|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>]
+  yruler estimate <summary.tsv> <model.tsv> [-x <tech>]
+-i -: SAM on stdin
+-x: illumina (default), element (experimental), hifi, ont, hic (experimental)";
+fn tech(t: &str) -> &'static str { TECH.iter().find(|&&x| x == t).copied().unwrap_or_else(|| die(&format!("-x {t}: use one of {}", TECH.join(", ")))) }
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
+    // static libcurl: point it to the system CA bundle
+    if std::env::var_os("CURL_CA_BUNDLE").is_none() { if let Some(p) = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"].iter().find(|p| std::path::Path::new(p).exists()) { unsafe { std::env::set_var("CURL_CA_BUNDLE", p) }; } }
     match a.first().map(|s| s.as_str()) {
-        Some("estimate") => { if a.len() != 3 { die(USAGE); } estimate(&a[1], &a[2], &mut io::stdout().lock()); return; }
+        Some("estimate") => { let x = match a.len() { 3 => "illumina", 5 if a[3] == "-x" => tech(&a[4]), _ => die(USAGE) }; estimate(&a[1], &a[2], x, &mut io::stdout().lock()); return; }
         Some("--version") | Some("-V") => { println!("yruler {}", env!("CARGO_PKG_VERSION")); return; }
         None | Some("-h") | Some("--help") => { eprintln!("{USAGE}"); std::process::exit(if a.is_empty() { 1 } else { 0 }); }
         _ => {}
     }
     let mut o: HashMap<&str, String> = HashMap::new(); let mut i = 0;
-    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-n" | "-t" | "--bin") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); o.insert(k, v.clone()); i += 2; }
+    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bin") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); o.insert(k, v.clone()); i += 2; }
     let need = |k: &str| o.get(k).cloned().unwrap_or_else(|| die(&format!("missing {k}\n{USAGE}")));
-    let (input, markers, out) = (need("-i"), need("-m"), need("-o"));
+    let (input, markers, out) = (need("-i"), need("-m"), need("-o")); let x = o.get("-x").map_or("illumina", |t| tech(t));
     let thr = o.get("-t").map_or(std::thread::available_parallelism().map_or(1, |n| n.get()), |t| t.parse().unwrap_or_else(|_| die("-t")));
     let bin: u64 = o.get("--bin").map_or(500, |b| b.parse().unwrap_or_else(|_| die("--bin")));
     let name = o.get("-n").cloned().unwrap_or_else(|| { let b = std::path::Path::new(&input).file_name().map_or("sample".into(), |f| f.to_string_lossy().to_string()); b.split('.').next().unwrap_or("sample").to_string() });
     let src = if input == "-" { Src::Stdin } else { Src::Hts { input: input.clone(), reference: o.get("-r").cloned(), bed: o.get("-b").cloned() } };
-    eprintln!("yruler {} input {input} markers {markers} name {name} threads {thr} regions {}", env!("CARGO_PKG_VERSION"), o.get("-b").map_or("whole file", |s| s.as_str()));
+    eprintln!("yruler {} input {input} markers {markers} name {name} threads {thr} technology {x} regions {}", env!("CARGO_PKG_VERSION"), o.get("-b").map_or("whole file", |s| s.as_str()));
     count(src, &markers, &name, bin, thr, &out);
-    if let Some(m) = o.get("-M") { let p = format!("{out}/lengths.tsv"); let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))); estimate(&format!("{out}/summary.tsv"), m, &mut w); w.flush().unwrap(); print!("{}", std::fs::read_to_string(&p).unwrap()); }
+    if let Some(m) = o.get("-M") { let p = format!("{out}/lengths.tsv"); let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))); estimate(&format!("{out}/summary.tsv"), m, x, &mut w); w.flush().unwrap(); print!("{}", std::fs::read_to_string(&p).unwrap()); }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn masked_superstring() {   // uppercase starts a k-mer
+    fn masked_superstring() {   // uppercase starts a k-mer; header name before '_'
         let s = b"ACGTACGTACGTACGTACGTACGTACGTACGTa";
-        let mut ms = b">c1\n".to_vec(); ms.extend(s.iter().enumerate().map(|(i, b)| if i < 2 { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() })); ms.push(b'\n');
-        let e = super::expand_ms(&ms); let l: Vec<&[u8]> = e.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
-        assert_eq!(l[0], b">c1"); assert_eq!(l[1], &s[0..31]); assert_eq!(l[2], b"CGTACGTACGTACGTACGTACGTACGTACGT"); assert_eq!(l.len(), 3);
+        let mut ms = b">c1_x\n".to_vec(); ms.extend(s.iter().enumerate().map(|(i, b)| if i < 2 { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() })); ms.push(b'\n');
+        let r = super::ms_records(&ms); assert_eq!(r.len(), 1); assert_eq!(r[0].0, b"c1");
+        let st: Vec<usize> = (0..r[0].1.len() + 1 - super::K).filter(|&i| r[0].1[i].is_ascii_uppercase()).collect(); assert_eq!(st, vec![0, 1]);
+        assert_eq!(super::canon(&r[0].1[1..32]), super::canon(b"CGTACGTACGTACGTACGTACGTACGTACGT"));
     }
     #[test]
     fn median_select() {   // O(n) median = sort median
