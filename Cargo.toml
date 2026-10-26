@@ -7,6 +7,8 @@ license = "MIT"
 
 [dependencies]
 libc = "0.2"
+rust-htslib = { version = "1.0.2", default-features = false, features = ["bzip2", "lzma", "curl", "s3", "gcs"] }
+zstd = "0.14.3"
 
 [profile.release]
 opt-level = 3
