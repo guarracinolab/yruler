@@ -10,8 +10,8 @@ use std::time::Instant;
 const K: usize = 31;
 const MASK: u64 = (1u64 << 62) - 1;
 const EMPTY: u64 = u64::MAX;
-static CHUNK_SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-fn chunk() -> usize { *CHUNK_SZ.get_or_init(|| std::env::var("YRULER_CHUNK_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2) << 20) }   // read chunk bytes (2 MB: same speed as 8 to 64, least RSS)
+const CHUNK: usize = 2 << 20;   // read chunk bytes (2 MB: same speed as 8 to 64, least RSS); a longer line grows its chunk
+fn chunk() -> usize { CHUNK }
 
 static LUT: [u8; 256] = {
     let mut t = [4u8; 256];
@@ -281,7 +281,7 @@ fn read_stdin(tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
         let mut got = 0; while got < chunk() { let k = unsafe { libc::read(0, bp.add(got) as *mut libc::c_void, chunk() - got) }; if k == 0 { break; } if k < 0 { let e = io::Error::last_os_error(); if e.kind() == io::ErrorKind::Interrupted { continue; } die(&format!("stdin: {e}")); } got += k as usize; }
         unsafe { buf.set_len(start + got); } bytes += got as u64;
         if got == 0 { if !buf.is_empty() { tx.send((ci, buf)).unwrap(); } break; }
-        if let Some(p) = buf.iter().rposition(|&b| b == b'\n') { carry.extend_from_slice(&buf[p + 1..]); buf.truncate(p + 1); }
+        match buf.iter().rposition(|&b| b == b'\n') { Some(p) => { carry.extend_from_slice(&buf[p + 1..]); buf.truncate(p + 1); } None => { carry = buf; continue; } }   // no line end: line longer than the chunk, read on
         tx.send((ci, buf)).unwrap(); ci += 1;
     }
     bytes
@@ -313,7 +313,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
         None => (0..names.len() as u32).flat_map(|t| { let l = h.header().target_len(t).unwrap_or(0) as i64; (0..l.max(1)).step_by(10_000_000).map(move |a| (t, a, (a + 10_000_000).min(l))) }).collect() };
     let mut sh: Vec<Option<(u32, i64, i64, i64)>> = rg.iter().enumerate().map(|(i, &(t, a, e))| Some((t, a, e, if i > 0 && rg[i - 1].0 == t { rg[i - 1].2 } else { i64::MIN }))).collect();
     sh.push(None);   // unmapped
-    let nr = std::env::var("YRULER_READERS").ok().and_then(|v| v.parse().ok()).unwrap_or((thr / 2).max(1)).min(sh.len());
+    let nr = (thr / 2).max(1).min(sh.len());
     eprintln!("shards {} ({}) + unmapped, readers {nr}, htslib threads each {}", sh.len() - 1, if bed.is_some() { "bed regions" } else { "10 Mb windows" }, (thr / nr).max(1));
     let (next, ci, nrec, prx) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicU64::new(0), Mutex::new(prx));
     std::thread::scope(|sc| for _ in 0..nr { sc.spawn(|| {
@@ -342,7 +342,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
 fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
     let t0 = Instant::now();
     // reader: stdin read during the marker load (up to 64 chunks of 8 MB queued), chunks cut at line ends
-    let q: usize = std::env::var("YRULER_QUEUE").ok().and_then(|v| v.parse().ok()).unwrap_or(32); eprintln!("queue {q} chunks of {} MB", chunk() >> 20);
+    let q: usize = 32; eprintln!("queue {q} chunks of {} MB", chunk() >> 20);
     let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(q); let rx = Arc::new(Mutex::new(rx));
     let (ptx, prx) = mpsc::channel::<Vec<u8>>();   // used chunk buffers back to the reader (no new pages per chunk)
     let reader = spawn_reader(src, tx, prx, thr);
@@ -350,17 +350,16 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
     let per: Vec<usize> = (0..ncl).map(|j| mk.ocls.iter().filter(|&&c| c as usize == j).count()).collect();
     let tab = std::mem::replace(&mut mk.tab, Table { s: Vec::new(), cls: Vec::new(), mask: 0 });
     eprintln!("markers lines {} distinct {} classes {:?} per class {:?}; table {} MB; load {:.1} s; {}", mk.order.len(), n, mk.names, per, (tab.s.len() * 16) >> 20, t0.elapsed().as_secs_f64(), rss());
-    let bpk: usize = std::env::var("YRULER_BLOOM_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);   // Bloom bits per key
+    let bpk: usize = 16;   // Bloom bits per key
     let bloom = { let mut b = Bloom::new(n, bpk.max(1)); for &x in &mk.key { b.insert(hk(x)); } Arc::new(b) };
     eprintln!("bloom {} MB ({} bits/key)", bloom.b.len() * 8 >> 20, bpk.max(1));
     let tab = Arc::new(tab);
-    let cb: u32 = std::env::var("YRULER_CACHE_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);   // per-thread cache: 2^cb entries
+    let cb: u32 = 15;   // per-thread cache: 2^cb entries
     let (ftx, frx) = mpsc::sync_channel::<(u64, Vec<u8>)>(thr * 4);
     std::fs::create_dir_all(out).unwrap_or_else(|e| die(&format!("{out}: {e}")));
     let any_path = format!("{out}/any.fa");
     let writer = std::thread::Builder::new().name("yr-write".into()).spawn(move || { let mut w = BufWriter::with_capacity(1 << 22, std::fs::File::create(&any_path).unwrap_or_else(|e| die(&format!("{any_path}: {e}")))); let mut next = 0u64; let mut held: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();   // marker reads in input order
-        let unordered = std::env::var("YRULER_UNORDERED").is_ok();   // write blocks as they finish
-        for (i, b) in frx { if unordered { w.write_all(&b).unwrap_or_else(|e| die(&format!("write any.fa: {e}"))); continue; } held.insert(i, b); while let Some(b) = held.remove(&next) { w.write_all(&b).unwrap_or_else(|e| die(&format!("write any.fa: {e}"))); next += 1; } }
+        for (i, b) in frx { held.insert(i, b); while let Some(b) = held.remove(&next) { w.write_all(&b).unwrap_or_else(|e| die(&format!("write any.fa: {e}"))); next += 1; } }
         if !held.is_empty() { die("marker reads: chunks missing"); } w.flush().unwrap(); }).unwrap();
     let workers: Vec<_> = (0..thr).map(|_| {
         let (rx, ftx, ptx, tab, bloom) = (rx.clone(), ftx.clone(), ptx.clone(), tab.clone(), bloom.clone());
