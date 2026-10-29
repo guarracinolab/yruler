@@ -446,8 +446,9 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
     eprintln!("y_dose {:?} ysinglecopy_depth {:?} chr2depth_mean {:?}; total {:.1} s; {}", 2.0 * xd / ad, xd, ad, t0.elapsed().as_secs_f64(), rss());
 }
 
-const TECH: [&str; 5] = ["illumina", "element", "hifi", "ont", "hic"];
+const TECH: [&str; 4] = ["illumina", "hifi", "ont", "hic"];
 // estimate: length = K * sum_gc(class) / sum(ysinglecopy), K of technology x (model column 3, empty = illumina)
+// model column 4 (optional): reported length as a signed sum of class lengths (e.g. yq12-yq12_dyz2+dyz2), none = not reported
 fn estimate(summary: &str, model: &str, x: &str, o: &mut dyn Write) {
     let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
     let (sm, md) = (rd(summary), rd(model));
@@ -461,22 +462,28 @@ fn estimate(summary: &str, model: &str, x: &str, o: &mut dyn Write) {
         sg.push((f[0].to_string(), f[2].to_string(), v));
     }
     if !(ysum > 0.0) { die("no ysinglecopy sum > 0 in summary"); }
-    let mut k: HashMap<String, f64> = HashMap::new();
-    for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').collect(); if f.len() >= 2 && f[0] != "class" && f.get(2).map_or("illumina", |t| t.trim()) == x { k.insert(f[0].to_string(), f[1].parse().unwrap_or_else(|_| die(&format!("model K {}", f[1])))); } }
+    let mut k: HashMap<String, f64> = HashMap::new(); let mut rep: Vec<(String, String)> = vec![];
+    for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').map(|t| t.trim()).collect(); if f.len() >= 2 && f[0] != "class" && f.get(2).map_or("illumina", |t| t) == x {
+        k.insert(f[0].to_string(), f[1].parse().unwrap_or_else(|_| die(&format!("model K {}", f[1]))));
+        let t = f.get(3).copied().filter(|t| !t.is_empty()).unwrap_or(f[0]); if t != "none" { rep.push((f[0].to_string(), t.replace('-', "+-"))); } } }
     if k.is_empty() { die(&format!("model {model} has no K for technology {x}")); }
-    if x == "element" || x == "hic" { eprintln!("WARNING technology {x} is experimental"); }
-    writeln!(o, "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose").unwrap();
-    let mut n = 0;
-    for (s, c, v) in &sg { if let Some(kk) = k.get(c) { writeln!(o, "{s}\t{c}\t{:.0}\t{v:.1}\t{ysum:.0}\t{dose}", kk * v / ysum).unwrap(); n += 1; } }
     for c in k.keys() { if !sg.iter().any(|t| &t.1 == c) { die(&format!("model class {c} missing in summary")); } }
-    eprintln!("estimate technology {x} classes {n} y_dose {dose}");
+    if x == "hic" { eprintln!("WARNING technology {x} is experimental"); }
+    let sv: HashMap<&str, (&str, f64)> = sg.iter().map(|(s, c, v)| (c.as_str(), (s.as_str(), *v))).collect();
+    let len = |c: &str| k.get(c).unwrap_or_else(|| die(&format!("length term {c}: no K for technology {x}"))) * sv[c].1 / ysum;
+    writeln!(o, "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose").unwrap();
+    for (c, t) in &rep {
+        let l: f64 = t.split('+').filter(|p| !p.is_empty()).map(|p| p.strip_prefix('-').map_or_else(|| len(p), |q| -len(q))).sum();
+        writeln!(o, "{}\t{c}\t{l:.0}\t{:.1}\t{ysum:.0}\t{dose}", sv[c.as_str()].0, sv[c.as_str()].1).unwrap();
+    }
+    eprintln!("estimate technology {x} classes {} y_dose {dose}", rep.len());
 }
 
 const USAGE: &str = "usage:
   yruler -i <cram|bam|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>]
   yruler estimate <summary.tsv> <model.tsv> [-x <tech>]
 -i -: SAM on stdin
--x: illumina (default), element (experimental), hifi, ont, hic (experimental)";
+-x: illumina (default), hifi, ont, hic (experimental)";
 fn tech(t: &str) -> &'static str { TECH.iter().find(|&&x| x == t).copied().unwrap_or_else(|| die(&format!("-x {t}: use one of {}", TECH.join(", ")))) }
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
@@ -515,6 +522,14 @@ mod tests {
     fn median_select() {   // O(n) median = sort median
         let mut x = 7u64; for n in 1..400 { let v: Vec<u64> = (0..n).map(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (x >> 59) % 13 }).collect();
             let mut s = v.clone(); s.sort(); let m = if n % 2 == 1 { s[n / 2] as f64 } else { (s[n / 2 - 1] + s[n / 2]) as f64 / 2.0 }; assert_eq!(super::median(&v).0, m); }
+    }
+    #[test]
+    fn estimate_terms() {   // signed sum of class lengths; 'none' not reported
+        let d = std::env::temp_dir().join(format!("yruler_est_{}", std::process::id())); std::fs::create_dir_all(&d).unwrap(); let (s, m) = (d.join("s.tsv"), d.join("m.tsv"));
+        std::fs::write(&s, "#y_dose=1.0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t1\t1\t0\t10.0\nx\t1\tb\t1\t1\t1\t0\t4.0\nx\t1\tysinglecopy\t1\t100\t1\t0\t100.0\n").unwrap();
+        std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta-b\nb\t50\tillumina\tnone\nc\t1\thifi\n").unwrap();
+        let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose\nx\ta\t8\t10.0\t100\t1.0\n");
     }
     #[test]
     fn python_repr() {   // values from python3 repr()
