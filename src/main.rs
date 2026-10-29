@@ -440,7 +440,7 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
         let mut o = wr("summary.tsv");
         writeln!(o, "#y_dose={}\tysinglecopy_depth={}\tchr2depth_mean={}", pyf(2.0 * xd / ad), pyf(xd), pyf(ad)).unwrap();
         writeln!(o, "sample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc").unwrap();
-        for (j, c) in mk.names.iter().enumerate() { let v = &cv[j]; let (_, ms) = median(v); let z = v.iter().filter(|&&x| x == 0).count(); writeln!(o, "{name}\t{reads}\t{c}\t{}\t{}\t{ms}\t{:.4}\t{:.1}", v.len(), v.iter().sum::<u64>(), z as f64 / v.len() as f64, sg[j]).unwrap(); }
+        for (j, c) in mk.names.iter().enumerate() { let v = &cv[j]; let (_, ms) = median(v); let z = v.iter().filter(|&&x| x == 0).count(); writeln!(o, "{name}\t{reads}\t{c}\t{}\t{}\t{ms}\t{:.4}\t{}", v.len(), v.iter().sum::<u64>(), z as f64 / v.len() as f64, pyf(sg[j])).unwrap(); }   // full sum_gc: estimate reads it back
         o.flush().unwrap();
     }
     eprintln!("y_dose {:?} ysinglecopy_depth {:?} chr2depth_mean {:?}; total {:.1} s; {}", 2.0 * xd / ad, xd, ad, t0.elapsed().as_secs_f64(), rss());
