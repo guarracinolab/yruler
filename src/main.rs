@@ -217,6 +217,7 @@ fn work(chunk: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut V
         if line.is_empty() || line[0] == b'@' { continue; }
         let mut q = 0; let it = &mut q;
         field(line, it); let fl = num(field(line, it)); let rname = field(line, it); let pos = num(field(line, it)); let mapq = num(field(line, it));
+        if fl & 0x900 != 0 { continue; }   // secondary/supplementary, as for BAM/CRAM
         for _ in 0..4 { field(line, it); } let seq = field(line, it);
         read1(c, loc, fa, kb, rname, pos, mapq, fl, seq);
     }
