@@ -248,19 +248,25 @@ fn pyf(x: f64) -> String {
 }
 
 // GC curve from ysinglecopy, applied to array classes
-fn tm(a: &[u64], m: f64, lo: f64, hi: f64) -> f64 { let (mut s, mut n) = (0u64, 0u64); for &x in a { let y = x as f64; if lo * m <= y && y <= hi * m { s += x; n += 1; } } if n == 0 { f64::NAN } else { s as f64 / n as f64 } }
 fn median(v: &[u64]) -> (f64, String) {   // statistics.median and its Python repr
     let mut s = v.to_vec(); let n = s.len(); let hi = *s.select_nth_unstable(n / 2).1;   // O(n) selection, same values as a sort
     if n % 2 == 1 { (hi as f64, hi.to_string()) } else { let lo = *s[..n / 2].iter().max().unwrap(); let m = (lo + hi) as f64 / 2.0; (m, pyf(m)) }
 }
+// GC curve: ruler counts pooled per GC bin, counts above 10 x (mean + 1) dropped; needs 1e6 ruler counts, 1,000 markers and 1e4 counts per bin
+fn gc_bins(y: &[u64], by: &[Vec<u64>]) -> Vec<(usize, f64)> {
+    let s: u64 = y.iter().sum(); let m = s as f64 / y.len() as f64; let cap = 10.0 * (m + 1.0);
+    if (s as f64) < 1e6 || !(m > 0.0) { return vec![]; }
+    let kept = |a: &[u64]| a.iter().filter(|&&x| x as f64 <= cap).fold((0u64, 0u64), |(t, n), &x| (t + x, n + 1));
+    let (t, n) = kept(y); let al = t as f64 / n as f64;
+    (0..32).filter_map(|b| { let (t, n) = kept(&by[b]); (by[b].len() >= 1000 && t >= 10000).then(|| (b, t as f64 / n as f64 / al)) }).collect()
+}
 fn gc_sums(names: &[String], g: &[Vec<u8>], c: &[Vec<u64>]) -> Vec<f64> {
     let y = names.iter().position(|x| x == "ysinglecopy").unwrap_or_else(|| die("no ysinglecopy class"));
     let raw: Vec<f64> = c.iter().map(|v| v.iter().sum::<u64>() as f64).collect();
-    let (m, _) = median(&c[y]); let al = tm(&c[y], m, 0.5, 1.5);
-    if m < 10.0 || !(al > 0.0) { eprintln!("WARNING gc: ysinglecopy median count {m} < 10, no GC curve, sum_gc = sum"); return raw; }
     let mut by: Vec<Vec<u64>> = vec![vec![]; 32]; for (&q, &x) in g[y].iter().zip(&c[y]) { by[q as usize].push(x); }
-    let d: Vec<(usize, f64)> = (0..32).filter(|&b| by[b].len() >= 1000).map(|b| (b, tm(&by[b], m, 0.25, 2.5) / al)).collect();
-    if d.is_empty() || d.iter().any(|&(_, v)| !(v > 0.0)) { die("gc: bad curve"); }
+    let d = gc_bins(&c[y], &by);
+    if d.is_empty() { eprintln!("WARNING gc: ysinglecopy sum {}: too few counts for a GC curve, sum_gc = sum", raw[y]); return raw; }
+    if d.iter().any(|&(_, v)| !(v > 0.0)) { die("gc: bad curve"); }
     let r: Vec<f64> = (0..32).map(|b| { let mut best = d[0]; for &e in &d[1..] { if (e.0 as i64 - b as i64).abs() < (best.0 as i64 - b as i64).abs() { best = e; } } best.1 }).collect();
     let mut f = 0.0; for b in 0..32 { f += by[b].len() as f64 * r[b]; } f /= g[y].len() as f64;
     eprintln!("gc r(GC 10..20) {}", r[10..21].iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(" "));
@@ -531,6 +537,16 @@ mod tests {
         std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta-b\nb\t50\tillumina\tnone\nc\t1\thifi\n").unwrap();
         let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
         assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose\nx\ta\t8\t10.0\t100\t1.0\n");
+    }
+    #[test]
+    fn gc_curve() {   // pooled bin means recover a G+C-dependent loss at 0.5 counts per marker
+        let mut x = 11u64; let mut by: Vec<Vec<u64>> = vec![vec![]; 32]; let mut y = vec![];
+        for i in 0..3_000_000u64 { let b = 10 + (i % 4) as usize; let p = 0.25 * (1.0 + 0.1 * (b as f64 - 11.5));
+            let mut k = 0u64; for _ in 0..2 { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); if ((x >> 11) as f64 / (1u64 << 53) as f64) < p { k += 1; } }
+            by[b].push(k); y.push(k); }
+        let d = super::gc_bins(&y, &by); assert_eq!(d.len(), 4);
+        for (b, r) in d { let e = 1.0 + 0.1 * (b as f64 - 11.5); assert!((r - e).abs() < 0.01, "bin {b}: {r} vs {e}"); }
+        assert!(super::gc_bins(&y[..1000], &vec![vec![]; 32]).is_empty());   // too few ruler counts
     }
     #[test]
     fn python_repr() {   // values from python3 repr()
