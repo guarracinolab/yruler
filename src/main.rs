@@ -3,7 +3,7 @@
 // estimate: class sums -> array lengths, Y dosage
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
@@ -274,6 +274,7 @@ fn gc_sums(names: &[String], g: &[Vec<u8>], c: &[Vec<u64>]) -> Vec<f64> {
 }
 
 static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+static BINS: AtomicBool = AtomicBool::new(false);   // --bins given: aligned input only
 enum Src { Stdin, Hts { input: String, reference: Option<String>, bed: Option<String> } }
 type Tx = mpsc::SyncSender<(u64, Vec<u8>)>;
 // reads into SAM-like chunks cut at line ends
@@ -306,16 +307,58 @@ fn regions(bed: &str, names: &[Vec<u8>]) -> Vec<(u32, i64, i64)> {
     let found: usize = by.keys().filter(|k| names.contains(k)).count(); if found < by.len() { eprintln!("WARNING bed: {} of {} contigs not in the input header", by.len() - found, by.len()); }
     out
 }
-// CRAM/BAM: shards (region, previous end on contig) read in parallel, each read once
+// one record: flag u16, tid i32, pos i64, mapq u8, l_seq u32, 4-bit seq; 0xFF opens a binary chunk
+fn pack(buf: &mut Vec<u8>, rec: &rust_htslib::bam::Record) {
+    if buf.is_empty() { buf.push(0xFF); }
+    let l = rec.seq_len(); buf.extend_from_slice(&rec.flags().to_le_bytes()); buf.extend_from_slice(&rec.tid().to_le_bytes()); buf.extend_from_slice(&rec.pos().to_le_bytes()); buf.push(rec.mapq()); buf.extend_from_slice(&(l as u32).to_le_bytes());
+    buf.extend_from_slice(&rec.seq().encoded[..(l + 1) / 2]);
+}
+// SAM/BAM/CRAM without index, FASTQ/FASTA (plain or gzip), list a,b: one reader per file, start to end
+fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
+    use rust_htslib::{bam, htslib as h};
+    let cs = |s: &str| std::ffi::CString::new(s).unwrap_or_else(|_| die(&format!("{s}: NUL in the name")));
+    let newbuf = || prx.try_recv().unwrap_or_else(|_| Vec::with_capacity(chunk() + (1 << 17)));
+    let (mut rec, mut buf, mut ci, mut n) = (bam::Record::new(), newbuf(), 0u64, 0u64); buf.clear();
+    for f in input.split(',') {
+        let fp = unsafe { h::hts_open(cs(f).as_ptr(), c"r".as_ptr()) }; if fp.is_null() { die(&format!("{f}: cannot open")); }
+        if unsafe { (*fp).format.format } == h::htsExactFormat_empty_format { eprintln!("WARNING {f}: empty file, 0 reads"); unsafe { h::hts_close(fp); } continue; }
+        let kind = match unsafe { (*fp).format.format } { h::htsExactFormat_sam => "SAM", h::htsExactFormat_bam => "BAM", h::htsExactFormat_cram => "CRAM", h::htsExactFormat_fastq_format => "FASTQ", h::htsExactFormat_fasta_format => "FASTA", _ => die(&format!("{f}: not SAM, BAM, CRAM, FASTQ or FASTA")) };
+        if BINS.load(Relaxed) && matches!(kind, "FASTQ" | "FASTA") { die(&format!("{f}: {kind} has no read positions; --bins needs SAM, BAM or CRAM input")); }
+        if matches!(kind, "BAM" | "CRAM") { eprintln!("WARNING {f}: no index: one reader, start to end (slower)"); }
+        unsafe {
+            if let Some(r) = reference.filter(|_| kind == "CRAM") { if h::hts_set_fai_filename(fp, cs(r).as_ptr()) != 0 { die(&format!("reference {r}: cannot use it")); } }
+            if h::hts_set_threads(fp, thr.max(1) as i32) != 0 { eprintln!("WARNING {f}: no htslib threads"); }
+            if kind == "CRAM" && h::hts_set_opt(fp, h::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200) != 0 { eprintln!("WARNING {f}: cram required fields not set"); }
+        }
+        let hd = unsafe { h::sam_hdr_read(fp) }; if hd.is_null() { die(&format!("{f}: cannot read the header")); }
+        let names: Vec<Vec<u8>> = (0..unsafe { h::sam_hdr_nref(hd) }).map(|t| unsafe { std::ffi::CStr::from_ptr(h::sam_hdr_tid2name(hd, t)) }.to_bytes().to_vec()).collect();
+        if NAMES.get_or_init(|| names.clone()) != &names { die(&format!("{f}: contigs differ from the first input")); }
+        let mut m = 0u64;
+        loop {
+            let r = unsafe { h::sam_read1(fp, hd, rec.inner_mut()) }; if r == -1 { break; } if r < -1 { die(&format!("read {f}: htslib error {r}")); }
+            if rec.flags() & 0x900 != 0 { continue; }   // secondary/supplementary
+            pack(&mut buf, &rec); m += 1;
+            if buf.len() >= chunk() { let mut b = newbuf(); b.clear(); tx.send((ci, std::mem::replace(&mut buf, b))).unwrap(); ci += 1; }
+        }
+        unsafe { h::sam_hdr_destroy(hd); h::hts_close(fp); }
+        eprintln!("{f}: {kind}, records read (primary, one reader) {m}"); n += m;
+    }
+    if buf.len() > 1 { tx.send((ci, buf)).unwrap(); }
+    n
+}
+// CRAM/BAM: shards (region, previous end on contig) read in parallel, each read once; needs the index
 fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
     use rust_htslib::bam::{self, Read};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
-    let open = |t: usize| { let mut r = if input.contains("://") { bam::IndexedReader::from_url(&input.parse().unwrap_or_else(|e| die(&format!("{input}: {e}")))) } else { bam::IndexedReader::from_path(input) }.unwrap_or_else(|e| die(&format!("{input}: {e}")));
+    let idx = || if input.contains("://") { bam::IndexedReader::from_url(&input.parse().unwrap_or_else(|e| die(&format!("{input}: {e}")))) } else { bam::IndexedReader::from_path(input) };
+    let cfg = |mut r: bam::IndexedReader, t: usize| {
         if let Some(f) = reference { r.set_reference(f).unwrap_or_else(|e| die(&format!("reference {f}: {e}"))); }
         r.set_threads(t.max(1)).unwrap_or_else(|e| die(&format!("threads: {e}")));
         if let Err(e) = r.set_cram_options(rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200) { eprintln!("WARNING cram required fields: {e}"); }
         r };
-    let h = open(1); let names: Vec<Vec<u8>> = h.header().target_names().iter().map(|n| n.to_vec()).collect(); let _ = NAMES.set(names.clone());
+    let open = |t: usize| cfg(idx().unwrap_or_else(|e| die(&format!("{input}: {e}"))), t);
+    let h = match idx() { Ok(r) => cfg(r, 1), Err(_) if bed.is_none() => return read_seq(input, reference, thr, tx, prx), Err(e) => die(&format!("{input}: {e} (-b needs an indexed BAM or CRAM)")) };
+    let names: Vec<Vec<u8>> = h.header().target_names().iter().map(|n| n.to_vec()).collect(); let _ = NAMES.set(names.clone());
     let rg: Vec<(u32, i64, i64)> = match bed { Some(b) => regions(b, &names),
         None => (0..names.len() as u32).flat_map(|t| { let l = h.header().target_len(t).unwrap_or(0) as i64; (0..l.max(1)).step_by(10_000_000).map(move |a| (t, a, (a + 10_000_000).min(l))) }).collect() };
     let mut sh: Vec<Option<(u32, i64, i64, i64)>> = rg.iter().enumerate().map(|(i, &(t, a, e))| Some((t, a, e, if i > 0 && rg[i - 1].0 == t { rg[i - 1].2 } else { i64::MIN }))).collect();
@@ -334,9 +377,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
             while let Some(x) = r.read(&mut rec) {
                 x.unwrap_or_else(|e| die(&format!("read {input}: {e}")));
                 let (fl, p) = (rec.flags(), rec.pos()); if fl & 0x900 != 0 || (t >= 0 && p < a && p < pe) { continue; }   // secondary/supplementary, or seen in the previous shard
-                if buf.is_empty() { buf.push(0xFF); }   // binary record: flag u16, tid i32, pos i64, mapq u8, l_seq u32, 4-bit seq
-                let l = rec.seq_len(); buf.extend_from_slice(&fl.to_le_bytes()); buf.extend_from_slice(&rec.tid().to_le_bytes()); buf.extend_from_slice(&p.to_le_bytes()); buf.push(rec.mapq()); buf.extend_from_slice(&(l as u32).to_le_bytes());
-                buf.extend_from_slice(&rec.seq().encoded[..(l + 1) / 2]); n += 1;
+                pack(&mut buf, &rec); n += 1;
                 if buf.len() >= chunk() { let mut b = newbuf(); b.clear(); tx.send((ci.fetch_add(1, Relaxed), std::mem::replace(&mut buf, b))).unwrap(); }
             }
         }
@@ -346,7 +387,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
     let n = nrec.load(Relaxed); eprintln!("records read (primary) {n}"); n
 }
 
-fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
+fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, thr: usize, out: &str) {
     let t0 = Instant::now();
     // reader: stdin read during the marker load (up to 64 chunks of 8 MB queued), chunks cut at line ends
     let q: usize = 32; eprintln!("queue {q} chunks of {} MB", chunk() >> 20);
@@ -423,7 +464,7 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, thr: usize, out: &str) {
         o.flush().unwrap();
     }
     eprintln!("write counts {:.2} s", t1.elapsed().as_secs_f64());
-    {
+    if wbins {
         let mut o = wr("bins.tsv"); let mut v = vec![0u64; w]; let mut b: Vec<u8> = Vec::with_capacity(1 << 20);
         write!(o, "contig\tstart\treads\treads_mq20\tduplicates").unwrap();
         for c in &mk.names { write!(o, "\t{c}_hits\t{c}_hits_mq20\t{c}_reads").unwrap(); } writeln!(o).unwrap();
@@ -487,10 +528,11 @@ fn estimate(summary: &str, model: &str, x: &str, o: &mut dyn Write) {
 }
 
 const USAGE: &str = "usage:
-  yruler -i <cram|bam|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>]
+  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>]
   yruler estimate <summary.tsv> <model.tsv> [-x <tech>]
--i -: SAM on stdin
--x: illumina (default), hifi, ont, hic (experimental)";
+-i -: SAM on stdin; -i a,b: files read one after the other (FASTQ: plain or gzip, interleaved pairs in one file or R1,R2)
+-x: illumina (default), hifi, ont, hic (experimental)
+--bins <bp>: also write bins.tsv, reads and marker hits per <bp> of the reference (aligned input)";
 fn tech(t: &str) -> &'static str { TECH.iter().find(|&&x| x == t).copied().unwrap_or_else(|| die(&format!("-x {t}: use one of {}", TECH.join(", ")))) }
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
@@ -503,15 +545,15 @@ fn main() {
         _ => {}
     }
     let mut o: HashMap<&str, String> = HashMap::new(); let mut i = 0;
-    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bin") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); o.insert(k, v.clone()); i += 2; }
+    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
     let need = |k: &str| o.get(k).cloned().unwrap_or_else(|| die(&format!("missing {k}\n{USAGE}")));
     let (input, markers, out) = (need("-i"), need("-m"), need("-o")); let x = o.get("-x").map_or("illumina", |t| tech(t));
     let thr = o.get("-t").map_or(std::thread::available_parallelism().map_or(1, |n| n.get()), |t| t.parse().unwrap_or_else(|_| die("-t")));
-    let bin: u64 = o.get("--bin").map_or(500, |b| b.parse().unwrap_or_else(|_| die("--bin")));
+    let bins: Option<u64> = o.get("--bins").map(|b| b.parse().ok().filter(|&n| n > 0).unwrap_or_else(|| die("--bins: bin size in bp")));
     let name = o.get("-n").cloned().unwrap_or_else(|| { let b = std::path::Path::new(&input).file_name().map_or("sample".into(), |f| f.to_string_lossy().to_string()); b.split('.').next().unwrap_or("sample").to_string() });
     let src = if input == "-" { Src::Stdin } else { Src::Hts { input: input.clone(), reference: o.get("-r").cloned(), bed: o.get("-b").cloned() } };
     eprintln!("yruler {} input {input} markers {markers} name {name} threads {thr} technology {x} regions {}", env!("CARGO_PKG_VERSION"), o.get("-b").map_or("whole file", |s| s.as_str()));
-    count(src, &markers, &name, bin, thr, &out);
+    BINS.store(bins.is_some(), Relaxed); count(src, &markers, &name, bins.unwrap_or(500), bins.is_some(), thr, &out);
     if let Some(m) = o.get("-M") { let p = format!("{out}/lengths.tsv"); let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))); estimate(&format!("{out}/summary.tsv"), m, x, &mut w); w.flush().unwrap(); print!("{}", std::fs::read_to_string(&p).unwrap()); }
 }
 
