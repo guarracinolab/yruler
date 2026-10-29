@@ -1,6 +1,11 @@
-# yruler
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/yruler-logo-dark.svg">
+    <img src="docs/yruler-logo.svg" alt="yruler" width="400">
+  </picture>
+</p>
 
-Measure the human Y chromosome satellite arrays from sequencing reads.
+<p align="center">Measure the human Y chromosome satellite arrays from sequencing reads.</p>
 
 ## Build
 
