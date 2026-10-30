@@ -177,7 +177,7 @@ fn num(s: &[u8]) -> u64 { let mut v = 0u64; for &b in s { if !b.is_ascii_digit()
 fn itoa(b: &mut Vec<u8>, mut v: u64) { let mut t = [0u8; 20]; let mut i = 20; loop { i -= 1; t[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } } b.extend_from_slice(&t[i..]); }
 struct Ctx<'a> { bloom: &'a Bloom, tab: &'a Table, ncl: usize, bin: u64, h: Vec<u64>, last: (Vec<u8>, u64, usize) }
 // one read: k-mer hits, bin record, marker read
-fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64, bool)>, rname: &[u8], pos: u64, mapq: u64, fl: u64, seq: &[u8]) {
+fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64, bool)>, rname: &[u8], pos: u64, mapq: u64, fl: u64, seq: &[u8], qual: &[u8]) {
     let (w, b, mq) = (3 + 3 * c.ncl, pos / c.bin, mapq >= 20);
     let ri = if c.last.1 == b && c.last.0 == rname { c.last.2 } else {
         let ci = match loc.contigs.get(rname) { Some(&x) => x, None => { let x = loc.cname.len() as u32; loc.contigs.insert(rname.to_vec(), x); loc.cname.push(rname.to_vec()); x } };
@@ -186,12 +186,19 @@ fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64,
     };
     loc.reads += 1; c.h.iter_mut().for_each(|x| *x = 0); let h = &mut c.h;
     let (mut f, mut r, mut n, mut n_k) = (0u64, 0u64, 0usize, 0u64); kb.clear(); let cm = loc.cache.len() - 1;
+    let qm = QUAL.get().filter(|_| qual.len() == seq.len()); let seed = hk(fl ^ (pos << 16) ^ ((seq.len() as u64) << 48)); let (mut s, mut bad) = (0i64, usize::MAX);
     if seq != b"*" {
-        for &ch in seq {
+        for (i, &ch) in seq.iter().enumerate() {
             let ch = LUT[ch as usize];
-            if ch > 3 { n = 0; f = 0; r = 0; continue; }
+            if ch > 3 { n = 0; f = 0; r = 0; s = 0; continue; }
             f = ((f << 2) | ch as u64) & MASK; r = (r >> 2) | ((3 - ch as u64) << 60); n += 1;
-            if n >= K { n_k += 1; let x = f.min(r); let hx = hk(x); let e = unsafe { loc.cache.get_unchecked_mut((hx >> 40) as usize & cm) };
+            if let Some((qmin, lp)) = qm { if *qmin > 0 { if qual[i] < *qmin { bad = i; } } else { s += lp[qual[i] as usize]; if n > K { s -= lp[qual[i - K] as usize]; } } }
+            if n >= K { n_k += 1;
+                if let Some((qmin, _)) = qm {   // low-quality k-mer: dropped (min Q) or kept with P(all 31 bases right)
+                    if *qmin > 0 { if bad != usize::MAX && bad + K > i { continue; } }
+                    else if (sm(seed ^ f ^ ((i as u64) << 40)) >> 11) as f64 / (1u64 << 53) as f64 >= (s as f64 * 1e-9).exp() { continue; }
+                }
+                let x = f.min(r); let hx = hk(x); let e = unsafe { loc.cache.get_unchecked_mut((hx >> 40) as usize & cm) };
                 if e.key == x { if e.sc != 0 { loc.hits += 1; hit(e, c.tab, h); } }
                 else { prefetch(c.bloom.at(hx)); kb.push((x, hx, false)); } }
         }
@@ -219,7 +226,8 @@ fn work(chunk: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut V
         field(line, it); let fl = num(field(line, it)); let rname = field(line, it); let pos = num(field(line, it)); let mapq = num(field(line, it));
         if fl & 0x900 != 0 { continue; }   // secondary/supplementary, as for BAM/CRAM
         for _ in 0..4 { field(line, it); } let seq = field(line, it);
-        read1(c, loc, fa, kb, rname, pos, mapq, fl, seq);
+        let qv: Vec<u8> = if QUAL.get().is_some() { let q = field(line, it); if q == b"*" { vec![] } else { q.iter().map(|&b| b.wrapping_sub(33)).collect() } } else { vec![] };
+        read1(c, loc, fa, kb, rname, pos, mapq, fl, seq, &qv);
     }
 }
 // binary chunk (first byte 0xFF): flag u16, tid i32, pos i64, mapq u8, l_seq u32, 4-bit seq
@@ -230,7 +238,8 @@ fn work_bin(ch: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut 
         let fl = u16::from_le_bytes([ch[p], ch[p + 1]]) as u64; let tid = i32::from_le_bytes(ch[p + 2..p + 6].try_into().unwrap()); let pos = (i64::from_le_bytes(ch[p + 6..p + 14].try_into().unwrap()) + 1).max(0) as u64;
         let mq = ch[p + 14] as u64; let n = u32::from_le_bytes(ch[p + 15..p + 19].try_into().unwrap()) as usize; p += 19; let e = &ch[p..p + (n + 1) / 2]; p += (n + 1) / 2;
         sq.clear(); if n == 0 { sq.push(b'*'); } else { sq.extend((0..n).map(|i| NT[((e[i >> 1] >> (4 * (1 - (i & 1)))) & 15) as usize])); }
-        read1(c, loc, fa, kb, if tid < 0 { b"*" } else { &names[tid as usize] }, pos, mq, fl, sq);
+        let qs = if QUAL.get().is_some() { let q = &ch[p..p + n]; p += n; q } else { &ch[p..p] };
+        read1(c, loc, fa, kb, if tid < 0 { b"*" } else { &names[tid as usize] }, pos, mq, fl, sq, qs);
     }
 }
 
@@ -275,6 +284,8 @@ fn gc_sums(names: &[String], g: &[Vec<u8>], c: &[Vec<u64>]) -> Vec<f64> {
 
 static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 static BINS: AtomicBool = AtomicBool::new(false);   // --bins given: aligned input only
+static QUAL: std::sync::OnceLock<(u8, Vec<i64>)> = std::sync::OnceLock::new();   // --qual: min Q (0 = weight), ln P(base right) x 1e9 per Q
+fn sm(mut z: u64) -> u64 { z = z.wrapping_add(0x9e3779b97f4a7c15); z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9); z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb); z ^ (z >> 31) }
 enum Src { Stdin, Hts { input: String, reference: Option<String>, bed: Option<String> } }
 type Tx = mpsc::SyncSender<(u64, Vec<u8>)>;
 // reads into SAM-like chunks cut at line ends
@@ -312,6 +323,7 @@ fn pack(buf: &mut Vec<u8>, rec: &rust_htslib::bam::Record) {
     if buf.is_empty() { buf.push(0xFF); }
     let l = rec.seq_len(); buf.extend_from_slice(&rec.flags().to_le_bytes()); buf.extend_from_slice(&rec.tid().to_le_bytes()); buf.extend_from_slice(&rec.pos().to_le_bytes()); buf.push(rec.mapq()); buf.extend_from_slice(&(l as u32).to_le_bytes());
     buf.extend_from_slice(&rec.seq().encoded[..(l + 1) / 2]);
+    if QUAL.get().is_some() { buf.extend_from_slice(rec.qual()); }   // --qual: one phred byte per base
 }
 // SAM/BAM/CRAM without index, FASTQ/FASTA (plain or gzip), list a,b: one reader per file, start to end
 fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
@@ -328,7 +340,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
         unsafe {
             if let Some(r) = reference.filter(|_| kind == "CRAM") { if h::hts_set_fai_filename(fp, cs(r).as_ptr()) != 0 { die(&format!("reference {r}: cannot use it")); } }
             if h::hts_set_threads(fp, thr.max(1) as i32) != 0 { eprintln!("WARNING {f}: no htslib threads"); }
-            if kind == "CRAM" && h::hts_set_opt(fp, h::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200) != 0 { eprintln!("WARNING {f}: cram required fields not set"); }
+            if kind == "CRAM" && h::hts_set_opt(fp, h::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 }) != 0 { eprintln!("WARNING {f}: cram required fields not set"); }
         }
         let hd = unsafe { h::sam_hdr_read(fp) }; if hd.is_null() { die(&format!("{f}: cannot read the header")); }
         let names: Vec<Vec<u8>> = (0..unsafe { h::sam_hdr_nref(hd) }).map(|t| unsafe { std::ffi::CStr::from_ptr(h::sam_hdr_tid2name(hd, t)) }.to_bytes().to_vec()).collect();
@@ -354,7 +366,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
     let cfg = |mut r: bam::IndexedReader, t: usize| {
         if let Some(f) = reference { r.set_reference(f).unwrap_or_else(|e| die(&format!("reference {f}: {e}"))); }
         r.set_threads(t.max(1)).unwrap_or_else(|e| die(&format!("threads: {e}")));
-        if let Err(e) = r.set_cram_options(rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200) { eprintln!("WARNING cram required fields: {e}"); }
+        if let Err(e) = r.set_cram_options(rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 }) { eprintln!("WARNING cram required fields: {e}"); }
         r };
     let open = |t: usize| cfg(idx().unwrap_or_else(|e| die(&format!("{input}: {e}"))), t);
     let h = match idx() { Ok(r) => cfg(r, 1), Err(_) if bed.is_none() => return read_seq(input, reference, thr, tx, prx), Err(e) => die(&format!("{input}: {e} (-b needs an indexed BAM or CRAM)")) };
@@ -372,8 +384,14 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
         let mut buf = newbuf(); buf.clear();
         loop {
             let i = next.fetch_add(1, Relaxed); if i >= sh.len() { break; }
-            let (t, a, pe) = match sh[i] { Some((t, a, e, pe)) => { r.fetch((t as i32, a, e)).unwrap_or_else(|x| die(&format!("fetch {}:{a}-{e}: {x}", String::from_utf8_lossy(&names[t as usize])))); (t as i32, a, pe) }
-                None => { r.fetch(bam::FetchDefinition::Unmapped).unwrap_or_else(|x| die(&format!("fetch unmapped: {x}"))); (-1, i64::MIN, i64::MIN) } };
+            let (t, a, pe) = match sh[i] { Some((t, a, _, pe)) => (t as i32, a, pe), None => (-1, i64::MIN, i64::MIN) };
+            for k in 1..=6 {   // a failed fetch reads no record: reopen and retry (remote files)
+                let x = match sh[i] { Some((t, a, e, _)) => r.fetch((t as i32, a, e)), None => r.fetch(bam::FetchDefinition::Unmapped) };
+                let Err(x) = x else { break };
+                let w = match sh[i] { Some((t, a, e, _)) => format!("{}:{a}-{e}", String::from_utf8_lossy(&names[t as usize])), None => "unmapped".into() };
+                if k == 6 { die(&format!("fetch {w}: {x}")); }
+                eprintln!("WARNING fetch {w}: {x}; retry {k} of 5 in {} s", 10 * k); std::thread::sleep(std::time::Duration::from_secs(10 * k)); r = open(thr / nr);
+            }
             while let Some(x) = r.read(&mut rec) {
                 x.unwrap_or_else(|e| die(&format!("read {input}: {e}")));
                 let (fl, p) = (rec.flags(), rec.pos()); if fl & 0x900 != 0 || (t >= 0 && p < a && p < pe) { continue; }   // secondary/supplementary, or seen in the previous shard
@@ -545,7 +563,7 @@ fn main() {
         _ => {}
     }
     let mut o: HashMap<&str, String> = HashMap::new(); let mut i = 0;
-    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
+    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--qual") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
     let need = |k: &str| o.get(k).cloned().unwrap_or_else(|| die(&format!("missing {k}\n{USAGE}")));
     let (input, markers, out) = (need("-i"), need("-m"), need("-o")); let x = o.get("-x").map_or("illumina", |t| tech(t));
     let thr = o.get("-t").map_or(std::thread::available_parallelism().map_or(1, |n| n.get()), |t| t.parse().unwrap_or_else(|_| die("-t")));
@@ -553,6 +571,8 @@ fn main() {
     let name = o.get("-n").cloned().unwrap_or_else(|| { let b = std::path::Path::new(&input).file_name().map_or("sample".into(), |f| f.to_string_lossy().to_string()); b.split('.').next().unwrap_or("sample").to_string() });
     let src = if input == "-" { Src::Stdin } else { Src::Hts { input: input.clone(), reference: o.get("-r").cloned(), bed: o.get("-b").cloned() } };
     eprintln!("yruler {} input {input} markers {markers} name {name} threads {thr} technology {x} regions {}", env!("CARGO_PKG_VERSION"), o.get("-b").map_or("whole file", |s| s.as_str()));
+    if let Some(q) = o.get("--qual") { let m: u8 = if q == "weight" { 0 } else { q.strip_prefix("min:").and_then(|v| v.parse().ok()).filter(|&v: &u8| v > 0).unwrap_or_else(|| die("--qual: min:<Q> or weight")) };
+        let _ = QUAL.set((m, (0..256).map(|q| if q == 255 { 0 } else if q == 0 { -1_000_000_000_000_000 } else { ((1.0 - 10f64.powf(-(q as f64) / 10.0)).ln() * 1e9) as i64 }).collect())); eprintln!("base qualities: {}", if m == 0 { "k-mers kept with P(all bases right)".to_string() } else { format!("k-mers with a base below Q{m} dropped") }); }
     BINS.store(bins.is_some(), Relaxed); count(src, &markers, &name, bins.unwrap_or(500), bins.is_some(), thr, &out);
     if let Some(m) = o.get("-M") { let p = format!("{out}/lengths.tsv"); let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))); estimate(&format!("{out}/summary.tsv"), m, x, &mut w); w.flush().unwrap(); print!("{}", std::fs::read_to_string(&p).unwrap()); }
 }
