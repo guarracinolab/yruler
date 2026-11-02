@@ -178,7 +178,7 @@ fn itoa(b: &mut Vec<u8>, mut v: u64) { let mut t = [0u8; 20]; let mut i = 20; lo
 struct Ctx<'a> { bloom: &'a Bloom, tab: &'a Table, ncl: usize, bin: u64, h: Vec<u64>, last: (Vec<u8>, u64, usize) }
 // one read: k-mer hits, bin record, marker read
 fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64, bool)>, rname: &[u8], pos: u64, mapq: u64, fl: u64, seq: &[u8], qual: &[u8]) {
-    let (w, b, mq) = (3 + 3 * c.ncl, pos / c.bin, mapq >= 20);
+    let (w, b, mq) = (3 + 3 * c.ncl, pos.saturating_sub(1) / c.bin, mapq >= 20);   // pos is 1-based
     let ri = if c.last.1 == b && c.last.0 == rname { c.last.2 } else {
         let ci = match loc.contigs.get(rname) { Some(&x) => x, None => { let x = loc.cname.len() as u32; loc.contigs.insert(rname.to_vec(), x); loc.cname.push(rname.to_vec()); x } };
         let ri = *loc.bins.entry((ci, b)).or_insert_with(|| { loc.rk.push((ci, b)); loc.rv.resize(loc.rv.len() + w, 0); loc.rk.len() - 1 });
@@ -214,7 +214,7 @@ fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64,
     rec[0] += 1; if mq { rec[1] += 1; } if (fl >> 10) & 1 == 1 { rec[2] += 1; }
     let mut any = false;
     for j in 0..c.ncl { if h[j] > 0 { any = true; rec[3 + 3 * j] += h[j]; if mq { rec[4 + 3 * j] += h[j]; } rec[5 + 3 * j] += 1; } }
-    if any { fa.push(b'>'); fa.extend_from_slice(rname); fa.push(b'|'); itoa(fa, b); fa.push(b'|'); itoa(fa, mapq); fa.push(b'|'); itoa(fa, fl); fa.push(b'\n'); fa.extend_from_slice(seq); fa.push(b'\n'); }
+    if any && READS.get().is_some() { fa.push(b'>'); fa.extend_from_slice(rname); fa.push(b'|'); itoa(fa, b); fa.push(b'|'); itoa(fa, mapq); fa.push(b'|'); itoa(fa, fl); fa.push(b'\n'); fa.extend_from_slice(seq); fa.push(b'\n'); }
 }
 // SAM text chunk
 fn work(chunk: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64, bool)>) {
@@ -269,21 +269,23 @@ fn gc_bins(y: &[u64], by: &[Vec<u64>]) -> Vec<(usize, f64)> {
     let (t, n) = kept(y); let al = t as f64 / n as f64;
     (0..32).filter_map(|b| { let (t, n) = kept(&by[b]); (by[b].len() >= 1000 && t >= 10000).then(|| (b, t as f64 / n as f64 / al)) }).collect()
 }
-fn gc_sums(names: &[String], g: &[Vec<u8>], c: &[Vec<u64>]) -> Vec<f64> {
+fn isden(n: &str) -> bool { n == "chr2depth" || n.starts_with("depth") }   // autosomal denominator classes
+fn gc_sums(names: &[String], g: &[Vec<u8>], c: &[Vec<u64>]) -> (Vec<f64>, bool) {   // (sum_gc per class, G+C curve built)
     let y = names.iter().position(|x| x == "ysinglecopy").unwrap_or_else(|| die("no ysinglecopy class"));
     let raw: Vec<f64> = c.iter().map(|v| v.iter().sum::<u64>() as f64).collect();
     let mut by: Vec<Vec<u64>> = vec![vec![]; 32]; for (&q, &x) in g[y].iter().zip(&c[y]) { by[q as usize].push(x); }
     let d = gc_bins(&c[y], &by);
-    if d.is_empty() { eprintln!("WARNING gc: ysinglecopy sum {}: too few counts for a GC curve, sum_gc = sum", raw[y]); return raw; }
+    if d.is_empty() { eprintln!("WARNING gc: ysinglecopy sum {}: too few counts for a GC curve, sum_gc = sum; estimate per ruler if y_dose is above the model no-Y cut, else at haploid autosomal depth", raw[y]); return (raw, false); }
     if d.iter().any(|&(_, v)| !(v > 0.0)) { die("gc: bad curve"); }
     let r: Vec<f64> = (0..32).map(|b| { let mut best = d[0]; for &e in &d[1..] { if (e.0 as i64 - b as i64).abs() < (best.0 as i64 - b as i64).abs() { best = e; } } best.1 }).collect();
     let mut f = 0.0; for b in 0..32 { f += by[b].len() as f64 * r[b]; } f /= g[y].len() as f64;
     eprintln!("gc r(GC 10..20) {}", r[10..21].iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(" "));
-    names.iter().enumerate().map(|(k, n)| if n != "ysinglecopy" && n != "chr2depth" { let mut s = 0.0; for (&q, &x) in g[k].iter().zip(&c[k]) { s += x as f64 / r[q as usize]; } s * f } else { raw[k] }).collect()
+    (names.iter().enumerate().map(|(k, n)| if n != "ysinglecopy" && !isden(n) { let mut s = 0.0; for (&q, &x) in g[k].iter().zip(&c[k]) { s += x as f64 / r[q as usize]; } s * f } else { raw[k] }).collect(), true)
 }
 
 static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 static BINS: AtomicBool = AtomicBool::new(false);   // --bins given: aligned input only
+static READS: std::sync::OnceLock<String> = std::sync::OnceLock::new();   // --reads <file>: write marker reads; off by default, they are read sequences
 static QUAL: std::sync::OnceLock<(u8, Vec<i64>)> = std::sync::OnceLock::new();   // --qual: min Q (0 = weight), ln P(base right) x 1e9 per Q
 fn sm(mut z: u64) -> u64 { z = z.wrapping_add(0x9e3779b97f4a7c15); z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9); z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb); z ^ (z >> 31) }
 enum Src { Stdin, Hts { input: String, reference: Option<String>, bed: Option<String> } }
@@ -407,7 +409,7 @@ fn read_hts(input: &str, reference: Option<&str>, bed: Option<&str>, thr: usize,
 
 fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, thr: usize, out: &str) {
     let t0 = Instant::now();
-    // reader: stdin read during the marker load (up to 64 chunks of 8 MB queued), chunks cut at line ends
+    // reader: stdin read during the marker load (chunks queued, size printed at start), chunks cut at line ends
     let q: usize = 32; eprintln!("queue {q} chunks of {} MB", chunk() >> 20);
     let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(q); let rx = Arc::new(Mutex::new(rx));
     let (ptx, prx) = mpsc::channel::<Vec<u8>>();   // used chunk buffers back to the reader (no new pages per chunk)
@@ -423,9 +425,11 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, thr: usize,
     let cb: u32 = 15;   // per-thread cache: 2^cb entries
     let (ftx, frx) = mpsc::sync_channel::<(u64, Vec<u8>)>(thr * 4);
     std::fs::create_dir_all(out).unwrap_or_else(|e| die(&format!("{out}: {e}")));
-    let any_path = format!("{out}/any.fa");
-    let writer = std::thread::Builder::new().name("yr-write".into()).spawn(move || { let mut w = BufWriter::with_capacity(1 << 22, std::fs::File::create(&any_path).unwrap_or_else(|e| die(&format!("{any_path}: {e}")))); let mut next = 0u64; let mut held: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();   // marker reads in input order
-        for (i, b) in frx { held.insert(i, b); while let Some(b) = held.remove(&next) { w.write_all(&b).unwrap_or_else(|e| die(&format!("write any.fa: {e}"))); next += 1; } }
+    let any_path = READS.get().cloned();
+    let writer = std::thread::Builder::new().name("yr-write".into()).spawn(move || {
+        let Some(p) = any_path else { for _ in frx {} return; };   // no read sequences on disk by default
+        let mut w = BufWriter::with_capacity(1 << 22, std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))); let mut next = 0u64; let mut held: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();   // marker reads in input order
+        for (i, b) in frx { held.insert(i, b); while let Some(b) = held.remove(&next) { w.write_all(&b).unwrap_or_else(|e| die(&format!("write {p}: {e}"))); next += 1; } }
         if !held.is_empty() { die("marker reads: chunks missing"); } w.flush().unwrap(); }).unwrap();
     let workers: Vec<_> = (0..thr).map(|_| {
         let (rx, ftx, ptx, tab, bloom) = (rx.clone(), ftx.clone(), ptx.clone(), tab.clone(), bloom.clone());
@@ -495,62 +499,80 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, thr: usize,
         }
         o.write_all(&b).unwrap_or_else(|e| die(&format!("write bins.tsv: {e}"))); o.flush().unwrap();
     }
-    let need = ["ysinglecopy", "chr2depth"]; for c in need { if !mk.names.iter().any(|x| x == c) { die(&format!("missing class {c}")); } }
+    if !mk.names.iter().any(|x| x == "ysinglecopy") { die("missing class ysinglecopy"); }
+    let mut dm: Vec<f64> = mk.names.iter().enumerate().filter(|(_, n)| isden(n)).map(|(j, _)| cv[j].iter().sum::<u64>() as f64 / cv[j].len() as f64).collect();
+    if dm.is_empty() { die("missing denominator class (chr2depth or depth*)"); } dm.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let ix = |c: &str| mk.names.iter().position(|x| x == c).unwrap();
     let xd = cv[ix("ysinglecopy")].iter().sum::<u64>() as f64 / cv[ix("ysinglecopy")].len() as f64;
-    let ad = cv[ix("chr2depth")].iter().sum::<u64>() as f64 / cv[ix("chr2depth")].len() as f64;
-    if ad == 0.0 { die("chr2depth mean 0"); }
+    let ad = if dm.len() % 2 == 1 { dm[dm.len() / 2] } else { (dm[dm.len() / 2 - 1] + dm[dm.len() / 2]) / 2.0 };   // median of the window means
+    if ad == 0.0 { die("denominator mean 0"); }
     lap("counts and bins written");
-    let sg = gc_sums(&mk.names, &gv, &cv); lap("gc");
+    let (sg, gok) = gc_sums(&mk.names, &gv, &cv); lap("gc");
     {
         let mut o = wr("summary.tsv");
-        writeln!(o, "#y_dose={}\tysinglecopy_depth={}\tchr2depth_mean={}", pyf(2.0 * xd / ad), pyf(xd), pyf(ad)).unwrap();
+        writeln!(o, "#y_dose={}\tysinglecopy_depth={}\tdepth_mean={}\tgc_curve={}", pyf(2.0 * xd / ad), pyf(xd), pyf(ad), gok as u8).unwrap();
         writeln!(o, "sample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc").unwrap();
         for (j, c) in mk.names.iter().enumerate() { let v = &cv[j]; let (_, ms) = median(v); let z = v.iter().filter(|&&x| x == 0).count(); writeln!(o, "{name}\t{reads}\t{c}\t{}\t{}\t{ms}\t{:.4}\t{}", v.len(), v.iter().sum::<u64>(), z as f64 / v.len() as f64, pyf(sg[j])).unwrap(); }   // full sum_gc: estimate reads it back
         o.flush().unwrap();
     }
-    eprintln!("y_dose {:?} ysinglecopy_depth {:?} chr2depth_mean {:?}; total {:.1} s; {}", 2.0 * xd / ad, xd, ad, t0.elapsed().as_secs_f64(), rss());
+    eprintln!("y_dose {:?} ysinglecopy_depth {:?} depth_mean {:?} (median of {} denominator classes); total {:.1} s; {}", 2.0 * xd / ad, xd, ad, dm.len(), t0.elapsed().as_secs_f64(), rss());
 }
 
 const TECH: [&str; 4] = ["illumina", "hifi", "ont", "hic"];
-// estimate: length = K * sum_gc(class) / sum(ysinglecopy), K of technology x (model column 3, empty = illumina)
+// estimate: length = K * sum_gc(class) / sum(ysinglecopy), K of technology x (model column 3, empty = illumina);
+// basis ruler when the scaled y_dose is above the model no_y_dose (without a G+C curve: sum_gc = sum, as in the CV); no Y signal (y_dose <= no_y_dose, or no
+// no_y_dose line and gc_curve=0): length = K * sum(class) / (n_kmers(ysinglecopy) * depth_mean / 2), bp at haploid autosomal depth
+// depth_mean: median over the denominator classes (chr2depth or depth*) of their mean count; y_dose = 2 x ysinglecopy mean / depth_mean, divided in lengths.tsv by the model y_dose_scale
 // model column 4 (optional): reported length as a signed sum of class lengths (e.g. yq12-yq12_dyz2+dyz2), none = not reported
 fn estimate(summary: &str, model: &str, x: &str, o: &mut dyn Write) {
     let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
     let (sm, md) = (rd(summary), rd(model));
-    let mut dose = String::new(); let mut sg: Vec<(String, String, f64)> = vec![]; let mut ysum = f64::NAN;
+    let mut dose = String::new(); let mut sg: Vec<(String, String, f64)> = vec![]; let mut ysum = f64::NAN; let (mut gok, mut c2m, mut ny, mut raw) = (true, f64::NAN, f64::NAN, HashMap::new());
     for l in sm.lines() {
-        if let Some(h) = l.strip_prefix('#') { dose = h.split('\t').find_map(|f| f.strip_prefix("y_dose=")).unwrap_or("").to_string(); continue; }
+        if let Some(h) = l.strip_prefix('#') { let g = |k: &str| h.split('\t').find_map(|f| f.strip_prefix(k)).unwrap_or(""); dose = g("y_dose=").to_string(); gok = g("gc_curve=") != "0"; c2m = [g("depth_mean="), g("chr2depth_mean=")].iter().find(|v| !v.is_empty()).map_or(f64::NAN, |v| v.parse().unwrap_or(f64::NAN)); continue; }
         let f: Vec<&str> = l.split('\t').collect();
         if f.len() < 8 || f[0] == "sample" { continue; }
         let v: f64 = f[7].parse().unwrap_or_else(|_| die(&format!("sum_gc {}", f[7])));
-        if f[2] == "ysinglecopy" { ysum = f[4].parse().unwrap_or_else(|_| die("ysinglecopy sum")); }
+        if f[2] == "ysinglecopy" { ysum = f[4].parse().unwrap_or_else(|_| die("ysinglecopy sum")); ny = f[3].parse().unwrap_or(f64::NAN); }
+        raw.insert(f[2].to_string(), f[4].parse::<f64>().unwrap_or(f64::NAN));
         sg.push((f[0].to_string(), f[2].to_string(), v));
     }
-    if !(ysum > 0.0) { die("no ysinglecopy sum > 0 in summary"); }
     let mut k: HashMap<String, f64> = HashMap::new(); let mut rep: Vec<(String, String)> = vec![];
-    for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').map(|t| t.trim()).collect(); if f.len() >= 2 && f[0] != "class" && f.get(2).map_or("illumina", |t| t) == x {
+    let ys: f64 = md.lines().filter_map(|l| l.strip_prefix("#y_dose_scale=")).next().map_or(1.0, |v| v.trim().parse().unwrap_or_else(|_| die(&format!("model y_dose_scale {v}"))));   // y_dose of the reference male in the model cohort
+    let noy: Option<f64> = md.lines().filter_map(|l| l.strip_prefix("#no_y_dose=")).next().map(|v| v.trim().parse().unwrap_or_else(|_| die(&format!("model no_y_dose {v}"))));   // highest female y_dose in the model cohort
+    let rul = match (noy, dose.parse::<f64>()) { (Some(n), Ok(d)) => (d / ys * 1e4).round() / 1e4 > n, _ => gok };   // ruler basis: Y signal above the no-Y cut (4 decimals, as the cut)
+    if rul && !(ysum > 0.0) { die("no ysinglecopy sum > 0 in summary"); }
+    if !rul && !(ny > 0.0 && c2m > 0.0) { die("haploid basis needs ysinglecopy n_kmers and depth_mean in the summary"); }
+    if rul && !gok { eprintln!("WARNING no G+C curve: ruler basis without G+C correction (y_dose above the no-Y cut)"); }
+    let dose = dose.parse::<f64>().map_or(dose.clone(), |d| pyf(d / ys)); let basis = if rul { "ruler" } else { "haploid_depth" };
+    for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').map(|t| t.trim()).collect(); if f.len() >= 2 && f[0] != "class" && f.get(2).copied().filter(|t| !t.is_empty()).unwrap_or("illumina") == x {
         k.insert(f[0].to_string(), f[1].parse().unwrap_or_else(|_| die(&format!("model K {}", f[1]))));
         let t = f.get(3).copied().filter(|t| !t.is_empty()).unwrap_or(f[0]); if t != "none" { rep.push((f[0].to_string(), t.replace('-', "+-"))); } } }
-    if k.is_empty() { die(&format!("model {model} has no K for technology {x}")); }
+    if k.is_empty() {   // name what the model has
+        let mut t: Vec<&str> = md.lines().filter(|l| !l.starts_with('#')).filter_map(|l| { let f: Vec<&str> = l.split('\t').map(|t| t.trim()).collect(); (f.len() >= 2 && f[0] != "class").then(|| f.get(2).copied().filter(|t| !t.is_empty()).unwrap_or("illumina")) }).collect(); t.sort(); t.dedup();
+        die(&format!("model {model} has no K for technology {x}: it is calibrated for {}; use a model calibrated for {x}", t.join(", ")));
+    }
     for c in k.keys() { if !sg.iter().any(|t| &t.1 == c) { die(&format!("model class {c} missing in summary")); } }
     if x == "hic" { eprintln!("WARNING technology {x} is experimental"); }
     let sv: HashMap<&str, (&str, f64)> = sg.iter().map(|(s, c, v)| (c.as_str(), (s.as_str(), *v))).collect();
-    let len = |c: &str| k.get(c).unwrap_or_else(|| die(&format!("length term {c}: no K for technology {x}"))) * sv[c].1 / ysum;
-    writeln!(o, "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose").unwrap();
+    let kc = |c: &str| *k.get(c).unwrap_or_else(|| die(&format!("length term {c}: no K for technology {x}")));
+    let rel = |c: &str| if rul { sv[c].1 / ysum } else { raw[c] / (ny * c2m / 2.0) };   // relative value of the row class: marker signal per ruler signal, no K
+    let len = |c: &str| kc(c) * rel(c);
+    writeln!(o, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis").unwrap();
     for (c, t) in &rep {
         let l: f64 = t.split('+').filter(|p| !p.is_empty()).map(|p| p.strip_prefix('-').map_or_else(|| len(p), |q| -len(q))).sum();
-        writeln!(o, "{}\t{c}\t{l:.0}\t{:.1}\t{ysum:.0}\t{dose}", sv[c.as_str()].0, sv[c.as_str()].1).unwrap();
+        writeln!(o, "{}\t{c}\t{l:.0}\t{}\t{:.1}\t{ysum:.0}\t{dose}\t{basis}", sv[c.as_str()].0, pyf(rel(c)), sv[c.as_str()].1).unwrap();
     }
-    eprintln!("estimate technology {x} classes {} y_dose {dose}", rep.len());
+    eprintln!("estimate technology {x} classes {} y_dose {dose} (scale {ys}) basis {basis}", rep.len());
 }
 
 const USAGE: &str = "usage:
-  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>]
+  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>] [--reads <file>]
   yruler estimate <summary.tsv> <model.tsv> [-x <tech>]
 -i -: SAM on stdin; -i a,b: files read one after the other (FASTQ: plain or gzip, interleaved pairs in one file or R1,R2)
--x: illumina (default), hifi, ont, hic (experimental)
---bins <bp>: also write bins.tsv, reads and marker hits per <bp> of the reference (aligned input)";
+-x: illumina (default), hifi, ont, hic (experimental); the model needs K values for that technology (the released model.tsv: illumina)
+--bins <bp>: also write bins.tsv, reads and marker hits per <bp> of the reference (aligned input)
+--reads <file>: also write the sequences of the reads with a marker hit (off by default)";
 fn tech(t: &str) -> &'static str { TECH.iter().find(|&&x| x == t).copied().unwrap_or_else(|| die(&format!("-x {t}: use one of {}", TECH.join(", ")))) }
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
@@ -563,10 +585,11 @@ fn main() {
         _ => {}
     }
     let mut o: HashMap<&str, String> = HashMap::new(); let mut i = 0;
-    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--qual") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
+    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads" | "--qual") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
     let need = |k: &str| o.get(k).cloned().unwrap_or_else(|| die(&format!("missing {k}\n{USAGE}")));
     let (input, markers, out) = (need("-i"), need("-m"), need("-o")); let x = o.get("-x").map_or("illumina", |t| tech(t));
     let thr = o.get("-t").map_or(std::thread::available_parallelism().map_or(1, |n| n.get()), |t| t.parse().unwrap_or_else(|_| die("-t")));
+    if let Some(p) = o.get("--reads") { READS.set(p.clone()).unwrap(); }
     let bins: Option<u64> = o.get("--bins").map(|b| b.parse().ok().filter(|&n| n > 0).unwrap_or_else(|| die("--bins: bin size in bp")));
     let name = o.get("-n").cloned().unwrap_or_else(|| { let b = std::path::Path::new(&input).file_name().map_or("sample".into(), |f| f.to_string_lossy().to_string()); b.split('.').next().unwrap_or("sample").to_string() });
     let src = if input == "-" { Src::Stdin } else { Src::Hts { input: input.clone(), reference: o.get("-r").cloned(), bed: o.get("-b").cloned() } };
@@ -598,7 +621,33 @@ mod tests {
         std::fs::write(&s, "#y_dose=1.0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t1\t1\t0\t10.0\nx\t1\tb\t1\t1\t1\t0\t4.0\nx\t1\tysinglecopy\t1\t100\t1\t0\t100.0\n").unwrap();
         std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta-b\nb\t50\tillumina\tnone\nc\t1\thifi\n").unwrap();
         let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\tmarker_sum_gc\tysinglecopy_sum\ty_dose\nx\ta\t8\t10.0\t100\t1.0\n");
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t8\t0.1\t10.0\t100\t1.0\truler\n");
+    }
+    #[test]
+    fn estimate_haploid() {   // no G+C curve: K * sum / (ruler k-mers * chr2depth mean / 2)
+        let d = std::env::temp_dir().join(format!("yruler_hap_{}", std::process::id())); std::fs::create_dir_all(&d).unwrap(); let (s, m) = (d.join("s.tsv"), d.join("m.tsv"));
+        std::fs::write(&s, "#y_dose=0.0\tysinglecopy_depth=0.0\tchr2depth_mean=20\tgc_curve=0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t3\t1\t0\t3.0\nx\t1\tysinglecopy\t10\t0\t0\t1\t0.0\n").unwrap();
+        std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta\n").unwrap();
+        let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t3\t0.03\t3.0\t0\t0.0\thaploid_depth\n");   // 100 * 3 / (10 * 20 / 2)
+    }
+    #[test]
+    fn estimate_no_curve_ruler() {   // no G+C curve, y_dose above the no-Y cut: ruler basis, sum_gc = sum; below: haploid
+        let d = std::env::temp_dir().join(format!("yruler_ncr_{}", std::process::id())); std::fs::create_dir_all(&d).unwrap(); let (s, m) = (d.join("s.tsv"), d.join("m.tsv"));
+        let run = |yd: &str| { std::fs::write(&s, format!("#y_dose={yd}\tysinglecopy_depth=0.1\tdepth_mean=20\tgc_curve=0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t3\t1\t0\t3.0\nx\t1\tysinglecopy\t10\t30\t0\t1\t30.0\n")).unwrap();
+            std::fs::write(&m, "#y_dose_scale=0.5\n#no_y_dose=0.01\nclass\tK\ttech\tlength\na\t100\tillumina\ta\n").unwrap();
+            let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); String::from_utf8(o).unwrap() };
+        let (a, b) = (run("0.5"), run("0.004")); std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(a, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t10\t0.1\t3.0\t30\t1.0\truler\n");   // 100 * 3 / 30
+        assert_eq!(b, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t3\t0.03\t3.0\t30\t0.008\thaploid_depth\n");   // 100 * 3 / (10 * 20 / 2)
+    }
+    #[test]
+    fn estimate_scale_tech() {   // empty tech = illumina; y_dose / model y_dose_scale
+        let d = std::env::temp_dir().join(format!("yruler_sc_{}", std::process::id())); std::fs::create_dir_all(&d).unwrap(); let (s, m) = (d.join("s.tsv"), d.join("m.tsv"));
+        std::fs::write(&s, "#y_dose=1.0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t1\t1\t0\t10.0\nx\t1\tysinglecopy\t1\t100\t1\t0\t100.0\n").unwrap();
+        std::fs::write(&m, "#y_dose_scale=0.5\nclass\tK\ttech\tlength\na\t100\t\ta\n").unwrap();
+        let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t10\t0.1\t10.0\t100\t2.0\truler\n");
     }
     #[test]
     fn gc_curve() {   // pooled bin means recover a G+C-dependent loss at 0.5 counts per marker
