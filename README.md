@@ -63,3 +63,7 @@ Reads counted: every primary record, including duplicates and reads flagged as f
 
 - `--reads marker_reads.fa` (advanced): also write the sequences of the reads with a marker hit. yruler does not write read sequences otherwise, so the output holds counts only. Do not use this option on controlled-access data unless your data agreement allows it.
 - `--bins 500` (advanced): also write `bins.tsv`, with the reads and the marker hits of each class in every 500 bp of the reference genome. It needs aligned input (BAM, CRAM or SAM).
+
+## License
+
+MIT, see `LICENSE`.
