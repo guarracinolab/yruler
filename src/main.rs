@@ -185,6 +185,7 @@ fn read1(c: &mut Ctx, loc: &mut Local, fa: &mut Vec<u8>, kb: &mut Vec<(u64, u64,
         c.last = (rname.to_vec(), b, ri); ri
     };
     loc.reads += 1; c.h.iter_mut().for_each(|x| *x = 0); let h = &mut c.h;
+    if seq.contains(&b'=') { EQB.fetch_add(seq.iter().filter(|&&b| b == b'=').count() as u64, Relaxed); }
     let (mut f, mut r, mut n, mut n_k) = (0u64, 0u64, 0usize, 0u64); kb.clear(); let cm = loc.cache.len() - 1;
     let qm = QUAL.get().filter(|_| qual.len() == seq.len()); let seed = hk(fl ^ (pos << 16) ^ ((seq.len() as u64) << 48)); let (mut s, mut bad) = (0i64, usize::MAX);
     if seq != b"*" {
@@ -285,6 +286,7 @@ fn gc_sums(names: &[String], g: &[Vec<u8>], c: &[Vec<u64>]) -> (Vec<f64>, bool) 
 
 static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 static BINS: AtomicBool = AtomicBool::new(false);   // --bins given: aligned input only
+static EQB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);   // bases coded '=' (same as reference): not readable, k-mers across them lost
 static READS: std::sync::OnceLock<String> = std::sync::OnceLock::new();   // --reads <file>: write marker reads; off by default, they are read sequences
 static QUAL: std::sync::OnceLock<(u8, Vec<i64>)> = std::sync::OnceLock::new();   // --qual: min Q (0 = weight), ln P(base right) x 1e9 per Q
 fn sm(mut z: u64) -> u64 { z = z.wrapping_add(0x9e3779b97f4a7c15); z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9); z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb); z ^ (z >> 31) }
@@ -468,6 +470,7 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, thr: usize,
     eprintln!("bin records over workers {} (merged {nb}); {}", ord.len(), rss());
     eprintln!("reads {reads} bins {nb} bytes {} k-mers {kmers} cache misses {cmiss} ({:.2}%) bloom positives {bpos} hits {hits}; counting {:.1} s", bytes_in, 100.0 * cmiss as f64 / kmers.max(1) as f64, t_count);
     lap("bins merged");
+    let eq = EQB.load(Relaxed); if eq > 0 { die(&format!("{eq} read bases are written as '=' (same as the reference); yruler reads bases, not alignments, so it cannot recover them and the counts would be low. Write the file with explicit bases and run again")); }   // no output with unreadable bases
     let mut cnt: Vec<u64> = vec![0; n]; for sl in tab.s.iter() { if sl.key != EMPTY { cnt[sl.idx as usize] = sl.cnt.load(Relaxed) as u64; } }
     drop(tab); drop(bloom);   // counts extracted: table and filter freed
     // per class lists in marker order
@@ -544,7 +547,7 @@ fn estimate(summary: &str, model: &str, x: &str, o: &mut dyn Write) {
     if rul && !(ysum > 0.0) { die("no ysinglecopy sum > 0 in summary"); }
     if !rul && !(ny > 0.0 && c2m > 0.0) { die("haploid basis needs ysinglecopy n_kmers and depth_mean in the summary"); }
     if rul && !gok { eprintln!("WARNING no G+C curve: ruler basis without G+C correction (y_dose above the no-Y cut)"); }
-    let dose = dose.parse::<f64>().map_or(dose.clone(), |d| pyf(d / ys)); let basis = if rul { "ruler" } else { "haploid_depth" };
+    let dose = dose.parse::<f64>().map_or(dose.clone(), |d| format!("{:.4}", d / ys)); let basis = if rul { "ruler" } else { "haploid_depth" };   // y_dose with 4 decimals, as the basis rule
     for l in md.lines().filter(|l| !l.starts_with('#')) { let f: Vec<&str> = l.split('\t').map(|t| t.trim()).collect(); if f.len() >= 2 && f[0] != "class" && f.get(2).copied().filter(|t| !t.is_empty()).unwrap_or("illumina") == x {
         k.insert(f[0].to_string(), f[1].parse().unwrap_or_else(|_| die(&format!("model K {}", f[1]))));
         let t = f.get(3).copied().filter(|t| !t.is_empty()).unwrap_or(f[0]); if t != "none" { rep.push((f[0].to_string(), t.replace('-', "+-"))); } } }
@@ -621,7 +624,7 @@ mod tests {
         std::fs::write(&s, "#y_dose=1.0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t1\t1\t0\t10.0\nx\t1\tb\t1\t1\t1\t0\t4.0\nx\t1\tysinglecopy\t1\t100\t1\t0\t100.0\n").unwrap();
         std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta-b\nb\t50\tillumina\tnone\nc\t1\thifi\n").unwrap();
         let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t8\t0.1\t10.0\t100\t1.0\truler\n");
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t8\t0.1\t10.0\t100\t1.0000\truler\n");
     }
     #[test]
     fn estimate_haploid() {   // no G+C curve: K * sum / (ruler k-mers * chr2depth mean / 2)
@@ -629,7 +632,7 @@ mod tests {
         std::fs::write(&s, "#y_dose=0.0\tysinglecopy_depth=0.0\tchr2depth_mean=20\tgc_curve=0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t3\t1\t0\t3.0\nx\t1\tysinglecopy\t10\t0\t0\t1\t0.0\n").unwrap();
         std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta\n").unwrap();
         let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t3\t0.03\t3.0\t0\t0.0\thaploid_depth\n");   // 100 * 3 / (10 * 20 / 2)
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t3\t0.03\t3.0\t0\t0.0000\thaploid_depth\n");   // 100 * 3 / (10 * 20 / 2)
     }
     #[test]
     fn estimate_no_curve_ruler() {   // no G+C curve, y_dose above the no-Y cut: ruler basis, sum_gc = sum; below: haploid
@@ -638,8 +641,8 @@ mod tests {
             std::fs::write(&m, "#y_dose_scale=0.5\n#no_y_dose=0.01\nclass\tK\ttech\tlength\na\t100\tillumina\ta\n").unwrap();
             let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); String::from_utf8(o).unwrap() };
         let (a, b) = (run("0.5"), run("0.004")); std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(a, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t10\t0.1\t3.0\t30\t1.0\truler\n");   // 100 * 3 / 30
-        assert_eq!(b, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t3\t0.03\t3.0\t30\t0.008\thaploid_depth\n");   // 100 * 3 / (10 * 20 / 2)
+        assert_eq!(a, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t10\t0.1\t3.0\t30\t1.0000\truler\n");   // 100 * 3 / 30
+        assert_eq!(b, "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t3\t0.03\t3.0\t30\t0.0080\thaploid_depth\n");   // 100 * 3 / (10 * 20 / 2)
     }
     #[test]
     fn estimate_scale_tech() {   // empty tech = illumina; y_dose / model y_dose_scale
@@ -647,7 +650,7 @@ mod tests {
         std::fs::write(&s, "#y_dose=1.0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t1\t1\t0\t10.0\nx\t1\tysinglecopy\t1\t100\t1\t0\t100.0\n").unwrap();
         std::fs::write(&m, "#y_dose_scale=0.5\nclass\tK\ttech\tlength\na\t100\t\ta\n").unwrap();
         let mut o = vec![]; super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o); std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t10\t0.1\t10.0\t100\t2.0\truler\n");
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\tlength_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\testimate_basis\nx\ta\t10\t0.1\t10.0\t100\t2.0000\truler\n");
     }
     #[test]
     fn gc_curve() {   // pooled bin means recover a G+C-dependent loss at 0.5 counts per marker
