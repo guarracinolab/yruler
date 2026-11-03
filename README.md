@@ -49,7 +49,7 @@ With an index (`.bai` or `.crai`), yruler reads a BAM or CRAM file in parallel p
 The other columns:
 
 - `relative`: the class marker signal divided by the Y single-copy (ruler) signal, without the model scale factor; `length_bp` is this value times the class factor of the model. For `yq12`, `length_bp` is the sum of the `dyz1`, `dyz2` and rest-of-Yq12 lengths, and `relative` is the signal of the separate Yq12 marker class. It does not depend on sequencing depth or on the fraction of cells with a Y.
-- `y_dose`: Y copies relative to a typical male (1 = one Y in every cell), from the Y single-copy k-mers against autosomal reference k-mers.
+- `y_dose`: Y copies relative to a typical male (1 = one Y in every cell), from the Y single-copy k-mers against autosomal reference k-mers. A positive `y_dose` shows Y signal, not reliable lengths: with few Y reads (Y fraction below 0.1, or below 0.5x of Y-bearing coverage) lengths have large errors, and `y_dose` does not check that the Y is intact.
 - `estimate_basis`: `ruler` when `y_dose` is above the no-Y cut of the model (the highest `y_dose` of the females in the model cohort); with too few Y reads for a G+C curve, these values have no G+C correction and yruler prints a warning. `haploid_depth` when `y_dose` is at or below the cut (females, samples without Y). Then the values are background signal in bp at haploid autosomal depth, not array lengths.
 
 ## Options
