@@ -16,9 +16,45 @@ cargo build --release
 ## Run
 
 ```bash
-# BAM
 yruler -i sample.bam -m data/markers.ms.fa.zst -M model.tsv -o outdir
+```
 
+yruler counts the k-mers of each array in the reads and compares them with the k-mers of Y regions that have one copy (the ruler). A longer array gives a larger count.
+
+yruler writes `outdir/estimates.tsv` and prints it. The file has one row per class (7 rows) and 8 columns:
+
+| Column | Value |
+|---|---|
+| `sample` | sample name (`-n`) |
+| `class` | the array or repeat (table below) |
+| `estimate_bp` | the length of the array, or the sum of all units of the repeat, in bp |
+| `relative` | `marker_sum_gc` / `ysinglecopy_sum` ([Details](#how-estimates-are-computed)) |
+| `marker_sum_gc` | count of the class, G+C corrected |
+| `ysinglecopy_sum` | count of the ruler |
+| `y_dose` | how much Y the sample has, same value in all rows |
+| `y_status` | `y_found` or `no_y`, same value in all rows |
+
+| Class | `estimate_bp` |
+|---|---|
+| `yq12` | Yq12 array: DYZ1 + DYZ2 + the rest of Yq12 |
+| `dyz1` | DYZ1 in Yq12 |
+| `dyz2` | DYZ2 in Yq12 |
+| `dyz18s` | DYZ18 and 3.1 kb repeats, a part of the rest of Yq12 |
+| `dyz3` | DYZ3 array (Y centromere) |
+| `dyz17` | DYZ17 array |
+| `dyz19` | DYZ19 array |
+
+Before you use `estimate_bp`, read `y_status` and `y_dose`:
+
+- `y_status` = `y_found`: yruler found a Y, and `estimate_bp` is the array length.
+- `y_status` = `no_y`: yruler found no Y (for example, a female), and `estimate_bp` is only background noise.
+- `y_dose` = 1: one Y in every cell, as in a typical male. 0.4: a Y in 40% of the cells. 0: no Y. If `y_dose` is below 0.1, or the Y coverage is below 0.5x, the estimates have large errors. yruler does not look for deletions, so `y_dose` = 1 does not mean that the whole Y is present.
+
+`model.tsv` is calibrated on PCR-free Illumina 2x150 bp reads from the 1000 Genomes high-coverage project. PCR libraries, other read lengths and other projects shift the values, so compare only samples with the same protocol.
+
+## Input
+
+```bash
 # CRAM: add the FASTA it was compressed with
 yruler -i sample.cram -r GRCh38.fa -m data/markers.ms.fa.zst -M model.tsv -o outdir
 
@@ -28,41 +64,49 @@ yruler -i sample.fastq.gz -m data/markers.ms.fa.zst -M model.tsv -o outdir
 # FASTQ pairs in two files: list them with a comma
 yruler -i R1.fastq.gz,R2.fastq.gz -m data/markers.ms.fa.zst -M model.tsv -o outdir
 
-# SAM (plain or gzip)
-yruler -i sample.sam -m data/markers.ms.fa.zst -M model.tsv -o outdir
+# SAM (plain or gzip), or SAM on stdin with -i -
+samtools view -h sample.bam | yruler -i - -m data/markers.ms.fa.zst -M model.tsv -o outdir
 ```
 
-With an index (`.bai` or `.crai`), yruler reads parts of a BAM or CRAM file in parallel. Each read is counted on its own, so pairs give the same result interleaved or in two files.
-
-`lengths.tsv` in `outdir` has one value per class, in bp: the length of an array, or the amount of a repeat (all its units added up):
-
-| Class | Value |
-|---|---|
-| `dyz3` | length of DYZ3 (Y centromere) |
-| `yq12` | length of Yq12 (DYZ1 + DYZ2 + the rest of Yq12) |
-| `dyz1` | amount of DYZ1 in Yq12 |
-| `dyz2` | amount of DYZ2 in Yq12 |
-| `dyz18s` | amount of DYZ18 and 3.1 kb repeats, already inside Yq12: do not add it to `yq12` |
-| `dyz19` | length of DYZ19 |
-| `dyz17` | length of DYZ17 |
-
-The other columns:
-
-- `relative`: the class marker signal divided by the Y single-copy (ruler) signal, without the model scale factor; `length_bp` is this value times the class factor of the model. For `yq12`, `length_bp` is the sum of the `dyz1`, `dyz2` and rest-of-Yq12 lengths, and `relative` is the signal of the separate Yq12 marker class. With basis `ruler`, it does not depend on sequencing depth or on the fraction of cells with a Y.
-- `y_dose`, printed with 4 decimals as used by the basis rule: Y copies relative to a typical male (1 = one Y in every cell), from the Y single-copy k-mers against autosomal reference k-mers. A positive `y_dose` shows Y signal, not reliable lengths: with few Y reads (Y fraction below 0.1, or below 0.5x of Y-bearing coverage) lengths have large errors, and `y_dose` does not check that the Y is intact.
-- `estimate_basis`: `ruler` when `y_dose` is above the no-Y cut of the model (the highest `y_dose` of the females in the model cohort); with too few Y reads for a G+C curve, these values have no G+C correction and yruler prints a warning. `haploid_depth` when `y_dose` is at or below the cut (females, samples without Y). Then the values are background signal in bp at haploid autosomal depth, not array lengths.
+yruler also reads FASTA. Each read counts on its own, so pairs give the same result interleaved or in two files. With an index (`.bai` or `.crai`), yruler reads parts of a BAM or CRAM in parallel. If the file has bases written as `=` (same as the reference), yruler stops and writes no output.
 
 ## Options
 
-- `-r`: the FASTA that the CRAM was compressed with. Without `-r`, htslib looks for it through `REF_PATH`/`REF_CACHE` or downloads it by the MD5 in the CRAM header.
-- `-t`: number of threads.
-- `-n`: sample name.
-- `-x illumina` (default): the technology of the model. The `illumina` values are calibrated on PCR-free Illumina 2x150 bp reads of the 1000 Genomes high-coverage project. Other library preparations (PCR), read lengths and sequencing projects shift the values, so compare samples sequenced with one protocol. yruler does not detect the technology: give `-x` to match the reads.
-- `-b data/regions_grch38_1kgp_dragen376.bed`: read only the regions with marker reads and the autosomal reference window (chr8:91-101 Mb). Use it only for genomes aligned to GRCh38 with DRAGEN 3.7.6: other aligners place Yq12 reads elsewhere, and their Yq12 and DYZ2 values come out too low. It needs the index (`.bai` or `.crai`). Without `-b`, yruler reads all reads.
-Reads counted: every primary record, including duplicates and reads flagged as failing quality checks (0x200); secondary and supplementary records are skipped. Bases written as `=` (same as the reference) cannot be read without the alignment: yruler stops with an error and writes no output, so use files with explicit bases.
+- `-r`: the FASTA the CRAM was compressed with. Without `-r`, htslib uses `REF_PATH`/`REF_CACHE` or downloads the FASTA by the MD5 in the CRAM header.
+- `-t`: number of threads (default: all CPUs).
+- `-n`: sample name (default: the input file name up to the first `.`).
+- `-b data/regions_grch38_1kgp_dragen376.bed`: read only the marker regions, the unmapped reads and the autosomal window chr8:91-101 Mb. It needs the index. Use it only for GRCh38 alignments made with DRAGEN 3.7.6: other aligners put Yq12 reads elsewhere, and Yq12 and DYZ2 come out too low.
+- `-M`: the model. Without `-M`, yruler writes only `counts.tsv` and `summary.tsv` (see `yruler estimate` below).
+- `-x illumina` (default): the technology of the model. yruler does not detect the technology. `hifi`, `ont` and `hic` (experimental) need a model with K values for that technology; the released `model.tsv` has only `illumina`, and yruler stops with an error for the others.
 
-- `--reads marker_reads.fa` (advanced): also write the sequences of the reads with a marker hit. yruler does not write read sequences otherwise, so the output holds counts only. Do not use this option on controlled-access data unless your data agreement allows it.
-- `--bins 500` (advanced): also write `bins.tsv`, with the reads and the marker hits of each class in every 500 bp of the reference genome. It needs aligned input (BAM, CRAM or SAM).
+## Details
+
+### Reads counted
+
+yruler counts every primary record, duplicates and reads that fail quality checks (0x200) included, and skips secondary and supplementary records. It counts the 31-mers of each read that match the marker k-mers in `data/markers.ms.fa.zst`.
+
+### How estimates are computed
+
+The marker file has one k-mer set per class: the classes above, `yq12rest` (the rest of Yq12), `ysinglecopy` (Y single-copy k-mers, the ruler) and `depth1` (autosomal k-mers in the chr8 window).
+
+1. G+C correction: yruler fits a curve of ruler counts against k-mer G+C and divides the marker counts by it. This removes the G+C difference between markers and ruler; the ruler is the reference, so its count stays as it is. With too few ruler counts, there is no curve, `sum_gc` = `sum`, and yruler prints a warning.
+2. `y_dose` = 2 × mean ruler count / mean `depth1` count, divided by `y_dose_scale` in the model (the `y_dose` of the reference male of the model cohort). It is printed with 4 decimals.
+3. `y_status`: `y_found` if `y_dose` is above `no_y_dose` in the model (the highest female `y_dose` in the model cohort, 0.0067 in `model.tsv`), else `no_y`.
+4. `relative`: with `y_found`, `marker_sum_gc` / `ysinglecopy_sum`, so it does not change with sequencing depth or with the fraction of cells with a Y. With `no_y` there is no ruler, so yruler compares the count with one copy of an autosome: the class `sum` / (ruler k-mers × mean `depth1` count / 2).
+5. `estimate_bp` = K of the class in the model × `relative`. For `yq12`, `relative` comes from its own marker class, and `estimate_bp` is the sum of the `dyz1`, `dyz2` and `yq12rest` lengths, as the `length` column of `model.tsv` says.
+
+### Output files
+
+- `estimates.tsv`: see [Run](#run).
+- `summary.tsv`: one row per marker class with `nreads` (all reads of the sample), `n_kmers`, `sum`, `median`, `frac_zero` (fraction of k-mers with count 0) and `sum_gc`. The first line holds the `y_dose` before the model scale, `ysinglecopy_depth`, `depth_mean` and `gc_curve` (1 if the G+C curve was fitted).
+- `counts.tsv`: the count of each marker k-mer.
+
+`yruler estimate outdir/summary.tsv model.tsv [-x tech]` computes `estimates.tsv` again from `summary.tsv`, to stdout, without the reads. Use it to apply a different model.
+
+### Optional output
+
+- `--reads marker_reads.fa`: also write the reads with a marker hit, with the header `contig|bin|MAPQ|flag`. Without it, yruler writes no read sequences, only counts. On controlled-access data, use it only if your data agreement allows it.
+- `--bins 500`: also write `outdir/bins.tsv` with one row per 500 bp bin of the reference that has reads: `contig`, `start`, `reads`, `reads_mq20` (MAPQ 20 or more), `duplicates`, and for each class `<class>_hits`, `<class>_hits_mq20` and `<class>_reads`. It needs aligned input (BAM, CRAM or SAM).
 
 ## License
 
