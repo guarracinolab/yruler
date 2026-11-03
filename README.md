@@ -48,7 +48,7 @@ With an index (`.bai` or `.crai`), yruler reads parts of a BAM or CRAM file in p
 
 The other columns:
 
-- `relative`: the class marker signal divided by the Y single-copy (ruler) signal, without the model scale factor; `length_bp` is this value times the class factor of the model. For `yq12`, `length_bp` is the sum of the `dyz1`, `dyz2` and rest-of-Yq12 lengths, and `relative` is the signal of the separate Yq12 marker class. It does not depend on sequencing depth or on the fraction of cells with a Y.
+- `relative`: the class marker signal divided by the Y single-copy (ruler) signal, without the model scale factor; `length_bp` is this value times the class factor of the model. For `yq12`, `length_bp` is the sum of the `dyz1`, `dyz2` and rest-of-Yq12 lengths, and `relative` is the signal of the separate Yq12 marker class. With basis `ruler`, it does not depend on sequencing depth or on the fraction of cells with a Y.
 - `y_dose`, printed with 4 decimals as used by the basis rule: Y copies relative to a typical male (1 = one Y in every cell), from the Y single-copy k-mers against autosomal reference k-mers. A positive `y_dose` shows Y signal, not reliable lengths: with few Y reads (Y fraction below 0.1, or below 0.5x of Y-bearing coverage) lengths have large errors, and `y_dose` does not check that the Y is intact.
 - `estimate_basis`: `ruler` when `y_dose` is above the no-Y cut of the model (the highest `y_dose` of the females in the model cohort); with too few Y reads for a G+C curve, these values have no G+C correction and yruler prints a warning. `haploid_depth` when `y_dose` is at or below the cut (females, samples without Y). Then the values are background signal in bp at haploid autosomal depth, not array lengths.
 
@@ -57,7 +57,7 @@ The other columns:
 - `-r`: the FASTA that the CRAM was compressed with. Without `-r`, htslib looks for it through `REF_PATH`/`REF_CACHE` or downloads it by the MD5 in the CRAM header.
 - `-t`: number of threads.
 - `-n`: sample name.
-- `-x illumina` (default): the technology of the model. The released model is calibrated on Illumina short reads only, and yruler does not detect other technologies: do not use it for other reads.
+- `-x illumina` (default): the technology of the model. The `illumina` values are calibrated on PCR-free Illumina 2x150 bp reads of the 1000 Genomes high-coverage project. Other library preparations (PCR), read lengths and sequencing projects shift the values, so compare samples sequenced with one protocol. yruler does not detect the technology: give `-x` to match the reads.
 - `-b data/regions_grch38_1kgp_dragen376.bed`: read only the regions with marker reads and the autosomal reference window (chr8:91-101 Mb). Use it only for genomes aligned to GRCh38 with DRAGEN 3.7.6: other aligners place Yq12 reads elsewhere, and their Yq12 and DYZ2 values come out too low. It needs the index (`.bai` or `.crai`). Without `-b`, yruler reads all reads.
 Reads counted: every primary record, including duplicates and reads flagged as failing quality checks (0x200); secondary and supplementary records are skipped. Bases written as `=` (same as the reference) cannot be read without the alignment: yruler stops with an error and writes no output, so use files with explicit bases.
 

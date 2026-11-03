@@ -588,7 +588,7 @@ fn main() {
         _ => {}
     }
     let mut o: HashMap<&str, String> = HashMap::new(); let mut i = 0;
-    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads" | "--qual") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
+    while i < a.len() { let k = a[i].as_str(); if !matches!(k, "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads") { die(&format!("unknown option {k}\n{USAGE}")); } let v = a.get(i + 1).unwrap_or_else(|| die(&format!("{k} needs a value"))); if o.insert(k, v.clone()).is_some() { die(&format!("{k} given twice (several inputs: -i a,b)")); } i += 2; }
     let need = |k: &str| o.get(k).cloned().unwrap_or_else(|| die(&format!("missing {k}\n{USAGE}")));
     let (input, markers, out) = (need("-i"), need("-m"), need("-o")); let x = o.get("-x").map_or("illumina", |t| tech(t));
     let thr = o.get("-t").map_or(std::thread::available_parallelism().map_or(1, |n| n.get()), |t| t.parse().unwrap_or_else(|_| die("-t")));
@@ -597,8 +597,9 @@ fn main() {
     let name = o.get("-n").cloned().unwrap_or_else(|| { let b = std::path::Path::new(&input).file_name().map_or("sample".into(), |f| f.to_string_lossy().to_string()); b.split('.').next().unwrap_or("sample").to_string() });
     let src = if input == "-" { Src::Stdin } else { Src::Hts { input: input.clone(), reference: o.get("-r").cloned(), bed: o.get("-b").cloned() } };
     eprintln!("yruler {} input {input} markers {markers} name {name} threads {thr} technology {x} regions {}", env!("CARGO_PKG_VERSION"), o.get("-b").map_or("whole file", |s| s.as_str()));
-    if let Some(q) = o.get("--qual") { let m: u8 = if q == "weight" { 0 } else { q.strip_prefix("min:").and_then(|v| v.parse().ok()).filter(|&v: &u8| v > 0).unwrap_or_else(|| die("--qual: min:<Q> or weight")) };
-        let _ = QUAL.set((m, (0..256).map(|q| if q == 255 { 0 } else if q == 0 { -1_000_000_000_000_000 } else { ((1.0 - 10f64.powf(-(q as f64) / 10.0)).ln() * 1e9) as i64 }).collect())); eprintln!("base qualities: {}", if m == 0 { "k-mers kept with P(all bases right)".to_string() } else { format!("k-mers with a base below Q{m} dropped") }); }
+    // --qual hidden: not calibrated with the released model; future work: test if base qualities help
+    // if let Some(q) = o.get("--qual") { let m: u8 = if q == "weight" { 0 } else { q.strip_prefix("min:").and_then(|v| v.parse().ok()).filter(|&v: &u8| v > 0).unwrap_or_else(|| die("--qual: min:<Q> or weight")) };
+    // let _ = QUAL.set((m, (0..256).map(|q| if q == 255 { 0 } else if q == 0 { -1_000_000_000_000_000 } else { ((1.0 - 10f64.powf(-(q as f64) / 10.0)).ln() * 1e9) as i64 }).collect())); eprintln!("base qualities: {}", if m == 0 { "k-mers kept with P(all bases right)".to_string() } else { format!("k-mers with a base below Q{m} dropped") }); }
     BINS.store(bins.is_some(), Relaxed); count(src, &markers, &name, bins.unwrap_or(500), bins.is_some(), thr, &out);
     if let Some(m) = o.get("-M") { let p = format!("{out}/lengths.tsv"); let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))); estimate(&format!("{out}/summary.tsv"), m, x, &mut w); w.flush().unwrap(); print!("{}", std::fs::read_to_string(&p).unwrap()); }
 }
