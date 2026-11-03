@@ -36,10 +36,10 @@ yruler writes `outdir/estimates.tsv` and prints it. The file has one row per cla
 
 | Class | `estimate_bp` |
 |---|---|
-| `yq12` | Yq12 array: DYZ1 + DYZ2 + the rest of Yq12 |
+| `yq12` | Yq12 array: DYZ1 + DYZ2 + DYZ18S + the rest of Yq12 |
 | `dyz1` | DYZ1 in Yq12 |
 | `dyz2` | DYZ2 in Yq12 |
-| `dyz18s` | DYZ18 and 3.1 kb repeats, a part of the rest of Yq12 |
+| `dyz18s` | DYZ18 and 3.1 kb repeats, a part of Yq12 |
 | `dyz3` | DYZ3 array (Y centromere) |
 | `dyz17` | DYZ17 array |
 | `dyz19` | DYZ19 array |
@@ -87,13 +87,13 @@ yruler counts every primary record, duplicates and reads that fail quality check
 
 ### How estimates are computed
 
-The marker file has one k-mer set per class: the classes above, `yq12rest` (the rest of Yq12), `ysinglecopy` (Y single-copy k-mers, the ruler) and `depth1` (autosomal k-mers in the chr8 window).
+The marker file has one k-mer set per class: the classes above, `yq12rest2` (the rest of Yq12 without DYZ1, DYZ2 and DYZ18S), `ysinglecopy` (Y single-copy k-mers, the ruler) and `depth1` (autosomal k-mers in the chr8 window).
 
 1. G+C correction: yruler fits a curve of ruler counts against k-mer G+C and divides the marker counts by it. This removes the G+C difference between markers and ruler; the ruler is the reference, so its count stays as it is. With too few ruler counts, there is no curve, `sum_gc` = `sum`, and yruler prints a warning.
 2. `y_dose` = 2 × mean ruler count / mean `depth1` count, divided by `y_dose_scale` in the model (the `y_dose` of the reference male of the model cohort). It is printed with 4 decimals.
 3. `y_status`: `y_found` if `y_dose` is above `no_y_dose` in the model (the highest female `y_dose` in the model cohort, 0.0067 in `model.tsv`), else `no_y`.
 4. `relative`: with `y_found`, `marker_sum_gc` / `ysinglecopy_sum`, so it does not change with sequencing depth or with the fraction of cells with a Y. With `no_y` there is no ruler, so yruler compares the count with one copy of an autosome: the class `sum` / (ruler k-mers × mean `depth1` count / 2).
-5. `estimate_bp` = K of the class in the model × `relative`. For `yq12`, `relative` comes from its own marker class, and `estimate_bp` is the sum of the `dyz1`, `dyz2` and `yq12rest` lengths, as the `length` column of `model.tsv` says.
+5. `estimate_bp` = K of the class in the model × `relative`. For `yq12`, `relative` comes from its own marker class, and `estimate_bp` is the sum of the `dyz1`, `dyz2`, `dyz18s` and `yq12rest2` lengths, as the `length` column of `model.tsv` says.
 
 ### Output files
 

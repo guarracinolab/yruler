@@ -1680,7 +1680,7 @@ const TECH: [&str; 4] = ["illumina", "hifi", "ont", "hic"];
 // relative = sum(class) / (n_kmers(ysinglecopy) x depth_mean / 2), the signal at haploid autosomal depth.
 // depth_mean: median over the denominator classes (chr2depth or depth*) of their mean count.
 // y_dose = 2 x ysinglecopy mean / depth_mean, divided in estimates.tsv by the model y_dose_scale.
-// Model column 4 (optional): the reported value as a signed sum of classes (e.g. dyz1+dyz2+yq12rest), none = not reported.
+// Model column 4 (optional): the reported value as a signed sum of classes (e.g. dyz1+dyz2+dyz18s+yq12rest2), none = not reported.
 fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
     let (summary_text, model_text) = (read(summary), read(model));
