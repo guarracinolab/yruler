@@ -32,7 +32,7 @@ yruler -i R1.fastq.gz,R2.fastq.gz -m data/markers.ms.fa.zst -M model.tsv -o outd
 yruler -i sample.sam -m data/markers.ms.fa.zst -M model.tsv -o outdir
 ```
 
-With an index (`.bai` or `.crai`), yruler reads a BAM or CRAM file in parallel parts. Each read is counted on its own, so pairs give the same result interleaved or in two files.
+With an index (`.bai` or `.crai`), yruler reads parts of a BAM or CRAM file in parallel. Each read is counted on its own, so pairs give the same result interleaved or in two files.
 
 `lengths.tsv` in `outdir` has one value per class, in bp: the length of an array, or the amount of a repeat (all its units added up):
 
