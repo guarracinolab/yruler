@@ -1680,7 +1680,8 @@ const TECH: [&str; 4] = ["illumina", "hifi", "ont", "hic"];
 // relative = sum(class) / (n_kmers(ysinglecopy) x depth_mean / 2), the signal at haploid autosomal depth.
 // depth_mean: median over the denominator classes (chr2depth or depth*) of their mean count.
 // y_dose = 2 x ysinglecopy mean / depth_mean, divided in estimates.tsv by the model y_dose_scale.
-// Model column 4 (optional): the reported value as a signed sum of classes (e.g. dyz1+dyz2+dyz18s+yq12rest2), none = not reported.
+// Model column 4 (optional): the reported value as a signed sum of classes (e.g. dyz1+dyz2+dyz18s+yq12rest), none = not reported.
+// A row whose value sums several classes prints '.' for relative and marker_sum_gc; the terms column lists its classes.
 fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
     let (summary_text, model_text) = (read(summary), read(model));
@@ -1726,8 +1727,8 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
                 .unwrap_or_else(|_| die(&format!("model {} {v}", &key[1..key.len() - 1])))
         })
     };
-    let y_dose_scale = model_value("#y_dose_scale=").unwrap_or(1.0); // y_dose of the reference male in the model cohort
-    let no_y_dose = model_value("#no_y_dose="); // highest female y_dose in the model cohort
+    let y_dose_scale = model_value("#y_dose_scale=").unwrap_or(1.0); // median y_dose of the 1000 Genomes samples above half the cohort median
+    let no_y_dose = model_value("#no_y_dose="); // no-Y cut, above every female y_dose in the model cohorts
 
     // Y found: y_dose above the no-Y cut, both with 4 decimals
     let y_found = match (no_y_dose, y_dose_text.parse::<f64>()) {
@@ -1805,7 +1806,7 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
     let estimate_bp = |c: &str| k(c) * relative(c);
     writeln!(
         out,
-        "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status"
+        "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms"
     )
     .unwrap();
     for (class, terms) in &reported {
@@ -1818,10 +1819,15 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
             })
             .sum();
         let (sample, sum_gc) = by_class[class.as_str()];
+        let shown = terms.replace("+-", "-");
+        let (rel, gc) = if shown == *class {
+            (py_float(relative(class)), format!("{sum_gc:.1}"))
+        } else {
+            (".".to_string(), ".".to_string()) // sum of classes: no own ratio
+        };
         writeln!(
             out,
-            "{sample}\t{class}\t{bp:.0}\t{}\t{sum_gc:.1}\t{ruler_sum:.0}\t{y_dose}\t{y_status}",
-            py_float(relative(class))
+            "{sample}\t{class}\t{bp:.0}\t{rel}\t{gc}\t{ruler_sum:.0}\t{y_dose}\t{y_status}\t{shown}"
         )
         .unwrap();
     }
@@ -1907,6 +1913,9 @@ fn main() {
         .map_or(std::thread::available_parallelism().map_or(1, |n| n.get()), |t| {
             t.parse().unwrap_or_else(|_| die("-t"))
         });
+    if threads == 0 {
+        die("-t: use at least 1 thread");
+    }
     if let Some(p) = opts.get("--reads") {
         READS.set(p.clone()).unwrap();
     }
@@ -2013,7 +2022,7 @@ mod tests {
         let mut o = vec![];
         super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o);
         std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\nx\ta\t8\t0.1\t10.0\t100\t1.0000\ty_found\n");
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t8\t.\t.\t100\t1.0000\ty_found\ta-b\n");
     }
     #[test]
     fn estimate_haploid() {
@@ -2026,7 +2035,7 @@ mod tests {
         let mut o = vec![];
         super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o);
         std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\nx\ta\t3\t0.03\t3.0\t0\t0.0000\tno_y\n");
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t3\t0.03\t3.0\t0\t0.0000\tno_y\ta\n");
         // 100 * 3 / (10 * 20 / 2)
     }
     #[test]
@@ -2048,8 +2057,8 @@ mod tests {
         };
         let (a, b) = (run("0.5"), run("0.004"));
         std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(a, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\nx\ta\t10\t0.1\t3.0\t30\t1.0000\ty_found\n"); // 100 * 3 / 30
-        assert_eq!(b, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\nx\ta\t3\t0.03\t3.0\t30\t0.0080\tno_y\n");
+        assert_eq!(a, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t10\t0.1\t3.0\t30\t1.0000\ty_found\ta\n"); // 100 * 3 / 30
+        assert_eq!(b, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t3\t0.03\t3.0\t30\t0.0080\tno_y\ta\n");
         // 100 * 3 / (10 * 20 / 2)
     }
     #[test]
@@ -2063,7 +2072,7 @@ mod tests {
         let mut o = vec![];
         super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o);
         std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\nx\ta\t10\t0.1\t10.0\t100\t2.0000\ty_found\n");
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t10\t0.1\t10.0\t100\t2.0000\ty_found\ta\n");
     }
     #[test]
     fn gc_curve() {
