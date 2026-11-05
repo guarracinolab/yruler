@@ -85,7 +85,7 @@ yruler also reads FASTA. Each read counts on its own, so pairs give the same res
 
 ### Reads counted
 
-yruler counts every primary record, duplicates and reads that fail quality checks (0x200) included, and skips secondary and supplementary records. It counts the 31-mers of each read that match the marker k-mers in `data/markers.ms.fa.zst`.
+yruler counts every primary record, duplicates and reads that fail quality checks (0x200) included, and skips secondary and supplementary records. It counts the 31-mers of each read that match the marker k-mers in `data/markers.ms.fa.zst`. The model is calibrated on files that keep duplicate reads, so do not remove duplicates before you run yruler: files without them give shorter DYZ2 and Yq12 lengths.
 
 ### How estimates are computed
 
