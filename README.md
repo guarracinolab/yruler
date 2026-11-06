@@ -103,7 +103,7 @@ The marker file has one k-mer set per class: the classes above (for `yq12`, all 
 
 1. G+C correction: yruler fits a curve of ruler counts against k-mer G+C and divides the marker counts by it. This removes the G+C difference between markers and ruler; the ruler is the reference, so its count stays as it is. With too few ruler counts, there is no curve, `sum_gc` = `sum`, and yruler prints a warning.
 2. `y_dose` = 2 × mean ruler count / mean `depth1` count, divided by `y_dose_scale` in the model (the median `y_dose` of the 1000 Genomes samples above half the cohort median). It is printed with 4 decimals.
-3. `y_status`: `y_found` if `y_dose` is above `no_y_dose` in the model (0.02 in `model.tsv`, above the highest `y_dose` of the females in 1000 Genomes, HGDP and SGDP), else `no_y`.
+3. `y_status`: `y_found` if `y_dose` is above `no_y_dose` in the model (0.025 in `model.tsv`, above the highest `y_dose` of the females in 1000 Genomes, HGDP and SGDP), else `no_y`.
 4. `relative`: with `y_found`, `marker_sum_gc` / `ysinglecopy_sum`, so it does not change with sequencing depth or with the fraction of cells with a Y. With `no_y` there is no ruler, so yruler compares the count with one copy of an autosome: the class `sum` / (ruler k-mers × mean `depth1` count / 2).
 5. `estimate_bp` = K of the class in the model × `relative`. For `yq12`, `estimate_bp` is the sum of the `dyz1`, `dyz2`, `dyz18s` and `yq12rest` lengths, as the `length` column of `model.tsv` and the `terms` column say.
 
