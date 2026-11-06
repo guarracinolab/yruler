@@ -54,6 +54,16 @@ Before you use `estimate_bp`, read `y_status` and `y_dose`:
 
 `model.tsv` is calibrated on PCR-free Illumina 2x150 bp reads from the 1000 Genomes high-coverage project. PCR libraries, other read lengths and other projects shift the values, so compare only samples with the same protocol.
 
+### Nanopore reads
+
+`data/ont/` holds a second model, for nanopore R10.4.1 reads called with dorado in super-accuracy mode. It has its own marker file, so pass both files and `-x ont`:
+
+```bash
+yruler -i sample.bam -x ont -m data/ont/markers.ms.fa.zst -M data/ont/model.tsv -o outdir
+```
+
+Use the files of one model together. The Illumina model and the nanopore model are calibrated apart, so compare nanopore samples only with other nanopore samples.
+
 ## Input
 
 ```bash
@@ -79,7 +89,7 @@ yruler also reads FASTA. Each read counts on its own, so pairs give the same res
 - `-n`: sample name (default: the input file name up to the first `.`).
 - `-b data/regions_grch38_1kgp_dragen376.bed`: read only the marker regions, the unmapped reads and the autosomal window chr8:91-101 Mb. It needs the index. Use it only for GRCh38 alignments made with DRAGEN 3.7.6: other aligners put Yq12 reads elsewhere, and Yq12 and DYZ2 come out too low.
 - `-M`: the model. Without `-M`, yruler writes only `counts.tsv` and `summary.tsv` (see `yruler estimate` below).
-- `-x illumina` (default): the technology of the model. yruler does not detect the technology. `hifi`, `ont` and `hic` (experimental) need a model with K values for that technology; the released `model.tsv` has only `illumina`, and yruler stops with an error for the others.
+- `-x illumina` (default): the technology of the model. yruler does not detect the technology. `model.tsv` has K values for `illumina` and `data/ont/model.tsv` has them for `ont` ([Nanopore reads](#nanopore-reads)); `hifi` and `hic` are experimental and no released model has them, so yruler stops with an error for those.
 
 ## Details
 
