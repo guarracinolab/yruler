@@ -1,12 +1,12 @@
 # length_bp = K * sum_gc(class) / sum(ysinglecopy); K per technology (-x); length: reported length as a signed sum of class lengths, none = not reported
-#y_dose_scale=0.986591
-#no_y_dose=0.020000
+#y_dose_scale=0.981338
+#no_y_dose=0.025000
 class	K	tech	length
-dyz3	18108802.749063693	ont	dyz3
-yq12	8328399.948723325	ont	dyz1+dyz2+dyz18s+yq12rest
-dyz1	14511642.187468262	ont	dyz1
-dyz18s	16594244.471789269	ont	dyz18s
-dyz19	8357363.734874641	ont	dyz19
-dyz17	10525535.369976636	ont	dyz17
-dyz2	99218731.44357888	ont	dyz2
-yq12rest	52969610.749499016	ont	yq12rest
+dyz3	20256195.92997136	ont	dyz3
+yq12	8709644.048921756	ont	dyz1+dyz2+dyz18s+yq12rest2
+dyz1	15213633.441708455	ont	dyz1
+dyz18s	15597344.911456121	ont	dyz18s
+dyz19	9929486.316013306	ont	dyz19
+dyz17	12016359.993140766	ont	dyz17
+dyz2	165973805.3552285	ont	dyz2
+yq12rest2	57702426.94201815	ont	none

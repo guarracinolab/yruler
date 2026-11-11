@@ -7,11 +7,34 @@
 
 <p align="center">Measure the human Y chromosome satellite arrays from sequencing reads.</p>
 
-## Build
+## Install
 
 ```bash
-cargo build --release
+git clone https://github.com/guarracinolab/yruler
+cd yruler
+cargo build --release   # binary: target/release/yruler
 ```
+
+## Demo
+
+The demo streams the public 1000 Genomes DRAGEN 3.7.6 alignment of HG00126 from Amazon S3 and reads only the marker regions (`-b`), so it needs no download beforehand:
+
+```bash
+yruler -i https://s3.us-west-2.amazonaws.com/1000genomes-dragen-3.7.6/data/individuals/hg38-graph-based/HG00126/HG00126.bam \
+  -b data/regions_grch38_1kgp_dragen376.bed -m data/markers.ms.fa.zst -M model.tsv -n HG00126 -t 8 -o demo
+```
+
+Expected `demo/estimates.tsv` (columns `sample`, `class`, `estimate_bp`, `y_dose`, `y_status`):
+
+| class | estimate_bp | y_dose | y_status |
+|---|---|---|---|
+| dyz3 | 309126 | 0.9698 | y_found |
+| yq12 | 24159198 | 0.9698 | y_found |
+| dyz1 | 13477259 | 0.9698 | y_found |
+| dyz18s | 301675 | 0.9698 | y_found |
+| dyz19 | 408414 | 0.9698 | y_found |
+| dyz17 | 838697 | 0.9698 | y_found |
+| dyz2 | 10119601 | 0.9698 | y_found |
 
 ## Run
 
@@ -21,7 +44,7 @@ yruler -i sample.bam -m data/markers.ms.fa.zst -M model.tsv -o outdir
 
 yruler counts the k-mers of each array in the reads and compares them with the k-mers of Y regions that have one copy (the ruler). A longer array gives a larger count.
 
-yruler writes `outdir/estimates.tsv` and prints it. The file has one row per class (8 rows) and 9 columns:
+yruler writes `outdir/estimates.tsv` and prints it. The file has one row per reported class (7 rows) and 9 columns:
 
 | Column | Value |
 |---|---|
@@ -41,7 +64,6 @@ yruler writes `outdir/estimates.tsv` and prints it. The file has one row per cla
 | `dyz1` | DYZ1 in Yq12 |
 | `dyz2` | DYZ2 in Yq12 |
 | `dyz18s` | DYZ18 and 3.1 kb repeats, a part of Yq12 |
-| `yq12rest` | the rest of Yq12, without DYZ1, DYZ2 and DYZ18S |
 | `dyz3` | DYZ3 array (Y centromere) |
 | `dyz17` | DYZ17 array |
 | `dyz19` | DYZ19 array |
@@ -49,7 +71,7 @@ yruler writes `outdir/estimates.tsv` and prints it. The file has one row per cla
 Before you use `estimate_bp`, read `y_status` and `y_dose`:
 
 - `y_status` = `y_found`: yruler found a Y, and `estimate_bp` is the array length.
-- `y_status` = `no_y`: yruler found no Y (for example, a female), and `estimate_bp` is only background noise.
+- `y_status` = `no_y`: yruler found no Y (for example, a female), and `estimate_bp` is `NA`. `relative` and `marker_sum_gc` still hold the background counts.
 - `y_dose` = 1: one Y in every cell, as in a typical male. 0.4: a Y in 40% of the cells. 0: no Y. If `y_dose` is below 0.1, or the Y coverage is below 0.5x, the estimates have large errors. yruler does not look for deletions, so `y_dose` = 1 does not mean that the whole Y is present.
 
 `model.tsv` is calibrated on PCR-free Illumina 2x150 bp reads from the 1000 Genomes high-coverage project. PCR libraries, other read lengths and other projects shift the values, so compare only samples with the same protocol.
@@ -103,9 +125,9 @@ The marker file has one k-mer set per class: the classes above (for `yq12`, all 
 
 1. G+C correction: yruler fits a curve of ruler counts against k-mer G+C and divides the marker counts by it. This removes the G+C difference between markers and ruler; the ruler is the reference, so its count stays as it is. With too few ruler counts, there is no curve, `sum_gc` = `sum`, and yruler prints a warning.
 2. `y_dose` = 2 × mean ruler count / mean `depth1` count, divided by `y_dose_scale` in the model (the median `y_dose` of the 1000 Genomes samples above half the cohort median). It is printed with 4 decimals.
-3. `y_status`: `y_found` if `y_dose` is above `no_y_dose` in the model (0.025 in `model.tsv`, above the highest `y_dose` of the females in 1000 Genomes, HGDP and SGDP), else `no_y`.
-4. `relative`: with `y_found`, `marker_sum_gc` / `ysinglecopy_sum`, so it does not change with sequencing depth or with the fraction of cells with a Y. With `no_y` there is no ruler, so yruler compares the count with one copy of an autosome: the class `sum` / (ruler k-mers × mean `depth1` count / 2).
-5. `estimate_bp` = K of the class in the model × `relative`. For `yq12`, `estimate_bp` is the sum of the `dyz1`, `dyz2`, `dyz18s` and `yq12rest` lengths, as the `length` column of `model.tsv` and the `terms` column say.
+3. `y_status`: `y_found` if `y_dose` is above `no_y_dose` in the model (0.025 in `model.tsv` and `data/ont/model.tsv`, above the highest `y_dose` of the females in 1000 Genomes, HGDP, SGDP and the nanopore samples), else `no_y`. For `no_y` samples `estimate_bp` is `NA`.
+4. `relative` = `marker_sum_gc` / `ysinglecopy_sum` for every sample, so it does not change with sequencing depth. If `ysinglecopy_sum` is 0, `relative` and `estimate_bp` are `NA`.
+5. `estimate_bp` = K of the class in the model × `relative`. For `yq12`, `estimate_bp` is the sum of the `dyz1`, `dyz2`, `dyz18s` and `yq12rest2` lengths (`yq12rest2`: the rest of Yq12, computed but not reported on its own), as the `length` column of `model.tsv` and the `terms` column say.
 
 ### Output files
 

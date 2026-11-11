@@ -434,22 +434,30 @@ struct Ent {
     pend: u16,
     cls: u16,
 } // 16 bytes; sc = table slot + 1, 0 = not a marker
+// pending hits into the marker count; a count past u32 stops the run
+#[inline(always)]
+fn flush(tab: &Table, sc: u32, pend: u16) {
+    let p = tab.s[sc as usize - 1].cnt.fetch_add(pend as u32, Relaxed);
+    if p.checked_add(pend as u32).is_none() {
+        die("a marker count passed 4,294,967,295 (u32); with --gc-curve the counts are 4096 times the reads");
+    }
+}
 fn evict(e: &Ent, tab: &Table) {
     if e.sc != 0 && e.pend > 0 {
-        tab.s[e.sc as usize - 1].cnt.fetch_add(e.pend as u32, Relaxed);
+        flush(tab, e.sc, e.pend);
     }
 }
 #[inline(always)]
-fn hit(e: &mut Ent, tab: &Table, h: &mut [u64]) {
+fn hit(e: &mut Ent, tab: &Table, h: &mut [u64], rep: u64) {
     // count, flush before u16 overflow
-    if e.pend == u16::MAX {
-        tab.s[e.sc as usize - 1].cnt.fetch_add(e.pend as u32, Relaxed);
+    if e.pend as u64 + rep > u16::MAX as u64 {
+        flush(tab, e.sc, e.pend);
         e.pend = 0;
     }
-    e.pend += 1;
+    e.pend += rep as u16;
     let mut m = e.cls;
     while m != 0 {
-        h[m.trailing_zeros() as usize] += 1;
+        h[m.trailing_zeros() as usize] += rep;
         m &= m - 1;
     }
 }
@@ -518,6 +526,7 @@ fn count_read(
     fl: u64,
     seq: &[u8],
     qual: &[u8],
+    rep: u64,   // --gc-curve: how many times the read counts
 ) {
     let (w, b, mq) = (3 + 3 * c.ncl, pos.saturating_sub(1) / c.bin, mapq >= 20); // pos is 1-based
     let ri = if c.last.1 == b && c.last.0 == rname {
@@ -540,7 +549,7 @@ fn count_read(
         c.last = (rname.to_vec(), b, ri);
         ri
     };
-    loc.reads += 1;
+    loc.reads += rep;
     c.h.iter_mut().for_each(|x| *x = 0);
     let h = &mut c.h;
     if seq.contains(&b'=') {
@@ -597,7 +606,7 @@ fn count_read(
                 if e.key == x {
                     if e.sc != 0 {
                         loc.hits += 1;
-                        hit(e, c.tab, h);
+                        hit(e, c.tab, h, rep);
                     }
                 } else {
                     prefetch(c.bloom.at(hx));
@@ -641,16 +650,16 @@ fn count_read(
         }
         if e.sc != 0 {
             loc.hits += 1;
-            hit(e, c.tab, h);
+            hit(e, c.tab, h, rep);
         }
     }
     let rec = &mut loc.rv[ri * w..(ri + 1) * w];
-    rec[0] += 1;
+    rec[0] += rep;
     if mq {
-        rec[1] += 1;
+        rec[1] += rep;
     }
     if (fl >> 10) & 1 == 1 {
-        rec[2] += 1;
+        rec[2] += rep;
     }
     let mut any = false;
     for j in 0..c.ncl {
@@ -660,7 +669,7 @@ fn count_read(
             if mq {
                 rec[4 + 3 * j] += h[j];
             }
-            rec[5 + 3 * j] += 1;
+            rec[5 + 3 * j] += rep;
         }
     }
     if any && READS.get().is_some() {
@@ -711,7 +720,7 @@ fn work(chunk: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut V
         } else {
             vec![]
         };
-        count_read(c, loc, fa, kb, rname, pos, mapq, fl, seq, &qv);
+        count_read(c, loc, fa, kb, rname, pos, mapq, fl, seq, &qv, 1);   // SAM text: no --gc-curve weight (main checks)
     }
 }
 // binary chunk (first byte 0xFF): flag u16, tid i32, pos i64, mapq u8, l_seq u32, 4-bit seq
@@ -748,19 +757,57 @@ fn work_bin(
         } else {
             &ch[p..p]
         };
-        count_read(
-            c,
-            loc,
-            fa,
-            kb,
-            if tid < 0 { b"*" } else { &names[tid as usize] },
-            pos,
-            mq,
-            fl,
-            sq,
-            qs,
-        );
+        let mut rep = 1u64;
+        if let Some((w, cap)) = GCW.get() {
+            let mtid = i32::from_le_bytes(ch[p..p + 4].try_into().unwrap());
+            let tlen = i32::from_le_bytes(ch[p + 4..p + 8].try_into().unwrap()) as i64;
+            let span = u32::from_le_bytes(ch[p + 8..p + 12].try_into().unwrap()) as i64;
+            p += 12;
+            rep = gc_rep(w, *cap, tid, mtid, pos, tlen, span, sq);
+            if let Some(d) = GCDUMP.get() {
+                writeln!(d.lock().unwrap(), "{tid}\t{pos}\t{fl}\t{tlen}\t{rep}").unwrap_or_else(|e| die(&format!("YRULER_GC_DUMP: {e}")));
+            }
+        }
+        if rep > 0 {
+            count_read(
+                c,
+                loc,
+                fa,
+                kb,
+                if tid < 0 { b"*" } else { &names[tid as usize] },
+                pos,
+                mq,
+                fl,
+                sq,
+                qs,
+                rep,
+            );
+        }
     }
+}
+// Teitz 2018 weight of one read: fragment GC from the reference for a pair on one contig within the length cap, else the GC of the read
+#[allow(clippy::too_many_arguments)]
+fn gc_rep(w: &[f64], cap: f64, tid: i32, mtid: i32, pos: u64, tlen: i64, span: i64, sq: &[u8]) -> u64 {
+    let bits = GCREF.get().unwrap_or_else(|| die("--gc-curve: reference G+C bits not built"));
+    let p0 = pos as i64 - 1; // pos is 1-based
+    let frag = (tid >= 0 && mtid == tid && tlen != 0 && (tlen.abs() as f64) < cap)
+        .then(|| {
+            let (a, b) = if tlen > 0 { (p0, p0 + tlen) } else { (p0 + span + tlen, p0 + span) };
+            let v = &bits[tid as usize];
+            let (a, b) = (a.max(0) as usize, (b.max(0) as usize).min(v.len() * 64));
+            (b > a).then(|| gc_range(v, a, b) as f64 / tlen.abs() as f64)
+        })
+        .flatten();
+    let gc = match frag {
+        Some(g) => g,
+        None => {
+            if sq == b"*" || sq.is_empty() {
+                return GC_SCALE; // no bases: weight 1
+            }
+            sq.iter().filter(|&&b| matches!(b, b'G' | b'C' | b'g' | b'c')).count() as f64 / sq.len() as f64
+        }
+    };
+    (w[((gc * 200.0) as usize).min(200)] * GC_SCALE as f64).round() as u64
 }
 
 // Python repr of a float: shortest digits, fixed for exponents -4..15, else d.ddde-XX
@@ -828,8 +875,9 @@ fn median(v: &[u64]) -> (f64, String) {
 fn gc_bins(ruler: &[u64], ruler_by_gc: &[Vec<u64>]) -> Vec<(usize, f64)> {
     let total: u64 = ruler.iter().sum();
     let mean = total as f64 / ruler.len() as f64;
-    let cap = 10.0 * (mean + 1.0);
-    if (total as f64) < 1e6 || !(mean > 0.0) {
+    let u = unit() as f64; // thresholds in reads: with --gc-curve the counts are in units of 1 / GC_SCALE
+    let cap = 10.0 * (mean + u);
+    if (total as f64) < 1e6 * u || !(mean > 0.0) {
         return vec![];
     }
     let kept = |counts: &[u64]| {
@@ -843,13 +891,13 @@ fn gc_bins(ruler: &[u64], ruler_by_gc: &[Vec<u64>]) -> Vec<(usize, f64)> {
     (0..32)
         .filter_map(|gc| {
             let (sum, n) = kept(&ruler_by_gc[gc]);
-            (ruler_by_gc[gc].len() >= 1000 && sum >= 10000).then(|| (gc, sum as f64 / n as f64 / mean_kept))
+            (ruler_by_gc[gc].len() >= 1000 && sum as f64 >= 10000.0 * u).then(|| (gc, sum as f64 / n as f64 / mean_kept))
         })
         .collect()
 }
 // autosomal denominator classes
 fn is_depth_class(name: &str) -> bool {
-    name == "chr2depth" || name.starts_with("depth")
+    name.starts_with("depth")
 }
 // sum_gc of each class, and true if the G+C curve was built.
 // Array classes: sum of count / curve(G+C), scaled to the G+C mix of the ruler. Ruler and depth classes: raw sum.
@@ -865,7 +913,7 @@ fn gc_sums(names: &[String], gc: &[Vec<u8>], counts: &[Vec<u64>]) -> (Vec<f64>, 
     }
     let bins = gc_bins(&counts[y], &ruler_by_gc);
     if bins.is_empty() {
-        eprintln!("WARNING gc: ysinglecopy sum {}: too few counts for a GC curve, sum_gc = sum; estimate per ruler if y_dose is above the model no-Y cut, else at haploid autosomal depth", raw[y]);
+        eprintln!("WARNING gc: ysinglecopy sum {}: too few counts for a GC curve, sum_gc = sum; estimates per ruler without G+C correction", raw[y]);
         return (raw, false);
     }
     if bins.iter().any(|&(_, v)| !(v > 0.0)) {
@@ -920,6 +968,132 @@ static BINS: AtomicBool = AtomicBool::new(false); // --bins given: aligned input
 static EQB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // bases coded '=' (same as reference): not readable, k-mers across them lost
 static READS: std::sync::OnceLock<String> = std::sync::OnceLock::new(); // --reads <file>: write marker reads; off by default, they are read sequences
 static QUAL: std::sync::OnceLock<(u8, Vec<i64>)> = std::sync::OnceLock::new(); // --qual: min Q (0 = weight), ln P(base right) x 1e9 per Q
+// --gc-curve: Teitz 2018 GC correction, read weight min(3, 1 / bias(fragment GC)), counted in fixed point:
+// every hit adds round(weight x GC_SCALE), so all counts are GC_SCALE times the weighted count (summary header gc_weight_scale)
+const GC_SCALE: u64 = 4096; // weight error <= 0.5 / 4096; 3 x 4096 per hit keeps a 66,139-hit marker (HG00126 30x) at 8.1e8, under u32 4.29e9
+static GCW: std::sync::OnceLock<(Vec<f64>, f64)> = std::sync::OnceLock::new(); // weight per GC bin (201), fragment length cap
+static GCON: AtomicBool = AtomicBool::new(false); // --gc-curve given: packed records carry mate contig, TLEN and reference span
+static GCREF: std::sync::OnceLock<Vec<Vec<u64>>> = std::sync::OnceLock::new(); // G or C bit per reference base, by header contig index
+// YRULER_GC_DUMP=<file>: one line per read (contig index, 1-based position, flag, TLEN, weight x GC_SCALE), to check the weights
+static GCDUMP: std::sync::OnceLock<std::sync::Mutex<BufWriter<std::fs::File>>> = std::sync::OnceLock::new();
+// Teitz calculate_gc_curve.py output: GC_content, Smoothed_GC_bias, Raw_GC_bias, reads, locations
+fn gc_curve(path: &str, cap: f64) -> (Vec<f64>, f64) {
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let c: Vec<f64> = raw
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            l.split('\t')
+                .nth(1)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or_else(|| die(&format!("{path}: no smoothed bias in {l}")))
+        })
+        .collect();
+    if c.len() != 201 {
+        die(&format!("{path}: {} bias values, the curve needs 201 (200 bins)", c.len()));
+    }
+    if !(cap > 0.0) {
+        die("--gc-frag: fragment length cap in bp (Teitz: mean + 10 standard deviations)");
+    }
+    eprintln!(
+        "gc-curve {path} bias at GC 0.30/0.40/0.50/0.60 {:.3}/{:.3}/{:.3}/{:.3}, fragment cap {cap:.1} bp",
+        c[60], c[80], c[100], c[120]
+    );
+    (c.iter().map(|&v| (1.0 / (v + 1e-7)).min(3.0)).collect(), cap)
+}
+// one bit per reference base, set for G or C, in header contig order
+fn ref_gc(path: &str, names: &[Vec<u8>]) -> Vec<Vec<u64>> {
+    use std::io::BufRead;
+    let t0 = std::time::Instant::now();
+    let idx: HashMap<&[u8], usize> = names.iter().enumerate().map(|(i, n)| (n.as_slice(), i)).collect();
+    let mut out: Vec<Vec<u64>> = vec![Vec::new(); names.len()];
+    let f = std::fs::File::open(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let mut r = std::io::BufReader::with_capacity(1 << 22, f);
+    let (mut cur, mut pos, mut line) = (usize::MAX, 0usize, Vec::new());
+    loop {
+        line.clear();
+        if r
+            .read_until(b'\n', &mut line)
+            .unwrap_or_else(|e| die(&format!("{path}: {e}")))
+            == 0
+        {
+            break;
+        }
+        while line.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
+            line.pop();
+        }
+        if line.first() == Some(&b'>') {
+            let n = &line[1..line
+                .iter()
+                .position(|b| b.is_ascii_whitespace())
+                .unwrap_or(line.len())];
+            cur = idx.get(n).copied().unwrap_or(usize::MAX);
+            pos = 0;
+            continue;
+        }
+        if cur == usize::MAX || line.is_empty() {
+            continue;
+        }
+        let v = &mut out[cur];
+        if v.len() * 64 <= pos + line.len() {
+            v.resize((pos + line.len()) / 64 + 2, 0);
+        }
+        for &b in line.iter() {
+            if matches!(b, b'G' | b'C' | b'g' | b'c') {
+                v[pos >> 6] |= 1u64 << (pos & 63);
+            }
+            pos += 1;
+        }
+    }
+    let got = out.iter().filter(|v| !v.is_empty()).count();
+    if got == 0 {
+        die(&format!("{path}: no contig name matches the alignment header"));
+    }
+    eprintln!(
+        "reference G+C bits: {got} of {} contigs, {:.0} s, {}",
+        names.len(),
+        t0.elapsed().as_secs_f64(),
+        rss()
+    );
+    out
+}
+// --gc-curve: CRAM fields CIGAR, RNEXT, PNEXT, TLEN (decoded only when asked; without them TLEN reads 0)
+fn gc_fields() -> u32 {
+    if GCON.load(Relaxed) {
+        0x20 | 0x40 | 0x80 | 0x100
+    } else {
+        0
+    }
+}
+// --gc-curve: build the reference bits once, after the contig names are known
+// count units: GC_SCALE with --gc-curve, else 1
+fn unit() -> u64 {
+    if GCON.load(Relaxed) {
+        GC_SCALE
+    } else {
+        1
+    }
+}
+fn gc_bits(reference: Option<&str>, names: &[Vec<u8>]) {
+    if !GCON.load(Relaxed) || GCREF.get().is_some() {
+        return;
+    }
+    let r = reference.unwrap_or_else(|| die("--gc-curve needs -r <ref.fa>: the fragment GC comes from the reference"));
+    let _ = GCREF.set(ref_gc(r, names));
+}
+// G or C bases in [a, b)
+fn gc_range(bits: &[u64], a: usize, b: usize) -> u32 {
+    let (mut n, mut i) = (0u32, a);
+    while i < b {
+        let (w, e) = (i >> 6, ((i >> 6) + 1) << 6);
+        let hi = e.min(b);
+        let len = hi - i;
+        let m = if len == 64 { u64::MAX } else { ((1u64 << len) - 1) << (i & 63) };
+        n += (bits[w] & m).count_ones();
+        i = hi;
+    }
+    n
+}
 fn splitmix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -1058,6 +1232,17 @@ fn pack(buf: &mut Vec<u8>, rec: &rust_htslib::bam::Record) {
     if QUAL.get().is_some() {
         buf.extend_from_slice(rec.qual());
     } // --qual: one phred byte per base
+    if GCON.load(Relaxed) {
+        // --gc-curve: mate contig, TLEN, reference span (CIGAR M and D, as Teitz unbias_gc.py)
+        let span: u32 = rec
+            .raw_cigar()
+            .iter()
+            .map(|&c| if matches!(c & 0xf, 0 | 2) { c >> 4 } else { 0 })
+            .sum();
+        buf.extend_from_slice(&rec.mtid().to_le_bytes());
+        buf.extend_from_slice(&(rec.insert_size() as i32).to_le_bytes());
+        buf.extend_from_slice(&span.to_le_bytes());
+    }
 }
 // SAM/BAM/CRAM without index, FASTQ/FASTA (plain or gzip), list a,b: one reader per file, start to end
 fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
@@ -1110,7 +1295,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
                 && h::hts_set_opt(
                     fp,
                     h::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-                    0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 },
+                    0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 } | gc_fields(),
                 ) != 0
             {
                 eprintln!("WARNING {f}: cram required fields not set");
@@ -1130,6 +1315,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
         if NAMES.get_or_init(|| names.clone()) != &names {
             die(&format!("{f}: contigs differ from the first input"));
         }
+        gc_bits(reference, &names);
         let mut m = 0u64;
         loop {
             let r = unsafe { h::sam_read1(fp, hd, rec.inner_mut()) };
@@ -1190,7 +1376,7 @@ fn read_hts(
             .unwrap_or_else(|e| die(&format!("threads: {e}")));
         if let Err(e) = r.set_cram_options(
             rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-            0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 },
+            0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 } | gc_fields(),
         ) {
             eprintln!("WARNING cram required fields: {e}");
         }
@@ -1204,6 +1390,7 @@ fn read_hts(
     };
     let names: Vec<Vec<u8>> = h.header().target_names().iter().map(|n| n.to_vec()).collect();
     let _ = NAMES.set(names.clone());
+    gc_bits(reference, &names);
     let rg: Vec<(u32, i64, i64)> = match bed {
         Some(b) => regions(b, &names),
         None => (0..names.len() as u32)
@@ -1617,7 +1804,7 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, threads: us
         .map(|(j, _)| counts_by_class[j].iter().sum::<u64>() as f64 / counts_by_class[j].len() as f64)
         .collect();
     if depth_means.is_empty() {
-        die("missing denominator class (chr2depth or depth*)");
+        die("missing denominator class (depth*)");
     }
     depth_means.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let ix = |c: &str| markers.names.iter().position(|x| x == c).unwrap();
@@ -1638,11 +1825,12 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, threads: us
         let mut o = wr("summary.tsv");
         writeln!(
             o,
-            "#y_dose={}\tysinglecopy_depth={}\tdepth_mean={}\tgc_curve={}",
+            "#y_dose={}\tysinglecopy_depth={}\tdepth_mean={}\tgc_curve={}{}",
             py_float(2.0 * ruler_mean / depth_mean),
             py_float(ruler_mean),
             py_float(depth_mean),
-            gc_curve as u8
+            gc_curve as u8,
+            if GCON.load(Relaxed) { format!("\tgc_weight_scale={GC_SCALE}") } else { String::new() }
         )
         .unwrap();
         writeln!(o, "sample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc").unwrap();
@@ -1675,10 +1863,9 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, threads: us
 
 const TECH: [&str; 4] = ["illumina", "hifi", "ont", "hic"];
 // estimate_bp = K x relative, with K of the class for technology x (model column 3, empty = illumina).
-// y_found (scaled y_dose above the model no_y_dose): relative = sum_gc(class) / sum(ysinglecopy).
-// Without a G+C curve, sum_gc = sum. no_y (y_dose at or below no_y_dose, or no no_y_dose line and gc_curve=0):
-// relative = sum(class) / (n_kmers(ysinglecopy) x depth_mean / 2), the signal at haploid autosomal depth.
-// depth_mean: median over the denominator classes (chr2depth or depth*) of their mean count.
+// One formula for every sample: relative = sum_gc(class) / sum(ysinglecopy); without a G+C curve, sum_gc = sum;
+// NA when the ruler sum is 0 or y_status is no_y: y_found above the model no_y_dose, else no_y
+// (no no_y_dose line: y_found if a G+C curve was built).
 // y_dose = 2 x ysinglecopy mean / depth_mean, divided in estimates.tsv by the model y_dose_scale.
 // Model column 4 (optional): the reported value as a signed sum of classes (e.g. dyz1+dyz2+dyz18s+yq12rest), none = not reported.
 // A row whose value sums several classes prints '.' for relative and marker_sum_gc; the terms column lists its classes.
@@ -1689,33 +1876,24 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
     // summary.tsv: header line, then one row per class
     let mut y_dose_text = String::new();
     let mut gc_curve = true;
-    let mut depth_mean = f64::NAN;
     let mut ruler_sum = f64::NAN;
-    let mut ruler_kmers = f64::NAN;
     let mut rows: Vec<(String, String, f64)> = vec![]; // (sample, class, sum_gc)
-    let mut raw_sum: HashMap<String, f64> = HashMap::new();
     for line in summary_text.lines() {
         if let Some(header) = line.strip_prefix('#') {
             let get = |key: &str| header.split('\t').find_map(|f| f.strip_prefix(key)).unwrap_or("");
             y_dose_text = get("y_dose=").to_string();
             gc_curve = get("gc_curve=") != "0";
-            depth_mean = [get("depth_mean="), get("chr2depth_mean=")]
-                .iter()
-                .find(|v| !v.is_empty())
-                .map_or(f64::NAN, |v| v.parse().unwrap_or(f64::NAN));
             continue;
         }
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 8 || f[0] == "sample" {
             continue;
         }
-        let (sample, class, n_kmers, sum, sum_gc) = (f[0], f[2], f[3], f[4], f[7]);
+        let (sample, class, sum, sum_gc) = (f[0], f[2], f[4], f[7]);
         let sum_gc: f64 = sum_gc.parse().unwrap_or_else(|_| die(&format!("sum_gc {sum_gc}")));
         if class == "ysinglecopy" {
             ruler_sum = sum.parse().unwrap_or_else(|_| die("ysinglecopy sum"));
-            ruler_kmers = n_kmers.parse().unwrap_or(f64::NAN);
         }
-        raw_sum.insert(class.to_string(), sum.parse::<f64>().unwrap_or(f64::NAN));
         rows.push((sample.to_string(), class.to_string(), sum_gc));
     }
 
@@ -1735,14 +1913,13 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
         (Some(cut), Ok(d)) => (d / y_dose_scale * 1e4).round() / 1e4 > cut,
         _ => gc_curve,
     };
-    if y_found && !(ruler_sum > 0.0) {
-        die("no ysinglecopy sum > 0 in summary");
+    if ruler_sum.is_nan() {
+        die("no ysinglecopy row in summary");
     }
-    if !y_found && !(ruler_kmers > 0.0 && depth_mean > 0.0) {
-        die("the no_y estimate needs ysinglecopy n_kmers and depth_mean in the summary");
-    }
-    if y_found && !gc_curve {
-        eprintln!("WARNING no G+C curve: Y found (y_dose above the no-Y cut), estimates without G+C correction");
+    if !(ruler_sum > 0.0) {
+        eprintln!("WARNING ysinglecopy sum 0: estimates NA");
+    } else if !gc_curve {
+        eprintln!("WARNING no G+C curve: estimates without G+C correction");
     }
     let y_dose = y_dose_text
         .parse::<f64>()
@@ -1796,13 +1973,7 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
             .get(c)
             .unwrap_or_else(|| die(&format!("length term {c}: no K for technology {x}")))
     };
-    let relative = |c: &str| {
-        if y_found {
-            by_class[c].1 / ruler_sum
-        } else {
-            raw_sum[c] / (ruler_kmers * depth_mean / 2.0)
-        }
-    };
+    let relative = |c: &str| by_class[c].1 / ruler_sum;
     let estimate_bp = |c: &str| k(c) * relative(c);
     writeln!(
         out,
@@ -1820,14 +1991,16 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
             .sum();
         let (sample, sum_gc) = by_class[class.as_str()];
         let shown = terms.replace("+-", "-");
+        let na = !(ruler_sum > 0.0);
+        let bp = if na || !y_found { "NA".to_string() } else { format!("{bp:.0}") }; // no_y: no length (relative and marker_sum_gc kept)
         let (rel, gc) = if shown == *class {
-            (py_float(relative(class)), format!("{sum_gc:.1}"))
+            (if na { "NA".to_string() } else { py_float(relative(class)) }, format!("{sum_gc:.1}"))
         } else {
             (".".to_string(), ".".to_string()) // sum of classes: no own ratio
         };
         writeln!(
             out,
-            "{sample}\t{class}\t{bp:.0}\t{rel}\t{gc}\t{ruler_sum:.0}\t{y_dose}\t{y_status}\t{shown}"
+            "{sample}\t{class}\t{bp}\t{rel}\t{gc}\t{ruler_sum:.0}\t{y_dose}\t{y_status}\t{shown}"
         )
         .unwrap();
     }
@@ -1844,6 +2017,7 @@ const USAGE: &str = "usage:
 -x: illumina (default), hifi, ont, hic (experimental); the model needs K values for that technology (the released model.tsv: illumina)
 --bins <bp>: also write bins.tsv, reads and marker hits per <bp> of the reference (aligned input)
 --reads <file>: also write the sequences of the reads with a marker hit (off by default)";
+// --gc-curve <file> --gc-frag <bp> (not in the usage, experimental): weight every read by min(3, 1 / bias(fragment GC)) from a Teitz 2018 GC curve (aligned input, needs -r)
 fn tech(t: &str) -> &'static str {
     TECH.iter()
         .find(|&&x| x == t)
@@ -1891,7 +2065,7 @@ fn main() {
         let k = args[i].as_str();
         if !matches!(
             k,
-            "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads"
+            "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads" | "--gc-curve" | "--gc-frag"
         ) {
             die(&format!("unknown option {k}\n{USAGE}"));
         }
@@ -1918,6 +2092,26 @@ fn main() {
     }
     if let Some(p) = opts.get("--reads") {
         READS.set(p.clone()).unwrap();
+    }
+    if let Some(p) = opts.get("--gc-curve") {
+        if input == "-" {
+            die("--gc-curve: the fragment needs TLEN and the mate contig, so SAM on stdin is not enough; give the BAM or CRAM");
+        }
+        let cap: f64 = opts
+            .get("--gc-frag")
+            .unwrap_or_else(|| die("--gc-curve needs --gc-frag <bp>"))
+            .parse()
+            .unwrap_or_else(|_| die("--gc-frag: fragment length cap in bp"));
+        GCON.store(true, Relaxed);
+        let _ = GCW.set(gc_curve(p, cap));
+        if let Ok(f) = std::env::var("YRULER_GC_DUMP") {
+            let w = std::fs::File::create(&f).unwrap_or_else(|e| die(&format!("YRULER_GC_DUMP {f}: {e}")));
+            let _ = GCDUMP.set(std::sync::Mutex::new(BufWriter::new(w)));
+            eprintln!("gc-curve: read weights written to {f}");
+        }
+        eprintln!("gc-curve: counts in units of 1/{GC_SCALE} read (summary header gc_weight_scale={GC_SCALE})");
+    } else if opts.contains_key("--gc-frag") {
+        die("--gc-frag without --gc-curve");
     }
     let bins: Option<u64> = opts.get("--bins").map(|b| {
         b.parse()
@@ -1950,6 +2144,9 @@ fn main() {
     // let _ = QUAL.set((m, (0..256).map(|q| if q == 255 { 0 } else if q == 0 { -1_000_000_000_000_000 } else { ((1.0 - 10f64.powf(-(q as f64) / 10.0)).ln() * 1e9) as i64 }).collect())); eprintln!("base qualities: {}", if m == 0 { "k-mers kept with P(all bases right)".to_string() } else { format!("k-mers with a base below Q{m} dropped") }); }
     BINS.store(bins.is_some(), Relaxed);
     count(src, &markers, &name, bins.unwrap_or(500), bins.is_some(), threads, &out);
+    if let Some(d) = GCDUMP.get() {
+        d.lock().unwrap().flush().unwrap_or_else(|e| die(&format!("YRULER_GC_DUMP: {e}")));
+    }
     if let Some(m) = opts.get("-M") {
         let p = format!("{out}/estimates.tsv");
         let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}"))));
@@ -2025,22 +2222,21 @@ mod tests {
         assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t8\t.\t.\t100\t1.0000\ty_found\ta-b\n");
     }
     #[test]
-    fn estimate_haploid() {
-        // no G+C curve: K * sum / (ruler k-mers * chr2depth mean / 2)
+    fn estimate_zero_ruler() {
+        // ruler sum 0: estimate and relative NA, the same formula as every sample
         let d = std::env::temp_dir().join(format!("yruler_hap_{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let (s, m) = (d.join("s.tsv"), d.join("m.tsv"));
-        std::fs::write(&s, "#y_dose=0.0\tysinglecopy_depth=0.0\tchr2depth_mean=20\tgc_curve=0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t3\t1\t0\t3.0\nx\t1\tysinglecopy\t10\t0\t0\t1\t0.0\n").unwrap();
+        std::fs::write(&s, "#y_dose=0.0\tysinglecopy_depth=0.0\tdepth_mean=20\tgc_curve=0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t3\t1\t0\t3.0\nx\t1\tysinglecopy\t10\t0\t0\t1\t0.0\n").unwrap();
         std::fs::write(&m, "class\tK\ttech\tlength\na\t100\tillumina\ta\n").unwrap();
         let mut o = vec![];
         super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o);
         std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t3\t0.03\t3.0\t0\t0.0000\tno_y\ta\n");
-        // 100 * 3 / (10 * 20 / 2)
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\tNA\tNA\t3.0\t0\t0.0000\tno_y\ta\n");
     }
     #[test]
     fn estimate_no_curve_ruler() {
-        // no G+C curve, y_dose above the no-Y cut: ruler basis, sum_gc = sum; below: haploid
+        // no G+C curve: sum_gc = sum; ruler basis above and below the no-Y cut, y_status only flags it
         let d = std::env::temp_dir().join(format!("yruler_ncr_{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let (s, m) = (d.join("s.tsv"), d.join("m.tsv"));
@@ -2058,8 +2254,7 @@ mod tests {
         let (a, b) = (run("0.5"), run("0.004"));
         std::fs::remove_dir_all(&d).unwrap();
         assert_eq!(a, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t10\t0.1\t3.0\t30\t1.0000\ty_found\ta\n"); // 100 * 3 / 30
-        assert_eq!(b, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\t3\t0.03\t3.0\t30\t0.0080\tno_y\ta\n");
-        // 100 * 3 / (10 * 20 / 2)
+        assert_eq!(b, "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\nx\ta\tNA\t0.1\t3.0\t30\t0.0080\tno_y\ta\n"); // no_y: NA length, relative 3 / 30 kept
     }
     #[test]
     fn estimate_scale_tech() {
