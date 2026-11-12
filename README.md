@@ -72,7 +72,7 @@ Before you use `estimate_bp`, read `y_status` and `y_dose`:
 
 - `y_status` = `y_found`: yruler found a Y, and `estimate_bp` is the array length.
 - `y_status` = `no_y`: yruler found no Y (for example, a female), and `estimate_bp` is `NA`. `relative` and `marker_sum_gc` still hold the background counts.
-- `y_dose` = 1: one Y in every cell, as in a typical male. 0.4: Y markers at 40% of the male level, for example a Y in 40% of the cells. 0: no Y. If `y_dose` is below 0.1, or the Y coverage is below 0.5x, the estimates have large errors. yruler does not look for deletions, so `y_dose` = 1 does not mean that the whole Y is present.
+- `y_dose` = 1: one Y in every cell, as in a typical male. 0.4: Y markers at 40% of the male level, for example a Y in 40% of the cells. 0: no Y. If `y_dose` is below 0.1, or the Y coverage is below 0.5x, the estimates have large errors. `y_dose` is the mean over single-copy markers from the whole Y, so `y_dose` = 1 does not mean that every part of the Y is present.
 
 `model.tsv` is calibrated on PCR-free Illumina 2x150 bp reads from the 1000 Genomes high-coverage project. PCR libraries, other read lengths and other projects shift the values, so compare only samples with the same protocol.
 
