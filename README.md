@@ -28,13 +28,13 @@ Expected `demo/estimates.tsv` (columns `sample`, `class`, `estimate_bp`, `y_dose
 
 | class | estimate_bp | y_dose | y_status |
 |---|---|---|---|
-| dyz3 | 309126 | 0.9698 | y_found |
-| yq12 | 24159198 | 0.9698 | y_found |
-| dyz1 | 13477259 | 0.9698 | y_found |
-| dyz18s | 301675 | 0.9698 | y_found |
-| dyz19 | 408414 | 0.9698 | y_found |
-| dyz17 | 838697 | 0.9698 | y_found |
-| dyz2 | 10119601 | 0.9698 | y_found |
+| dyz3 | 309127 | 0.9678 | y_found |
+| yq12 | 24179752 | 0.9678 | y_found |
+| dyz1 | 13486581 | 0.9678 | y_found |
+| dyz18s | 304057 | 0.9678 | y_found |
+| dyz19 | 408414 | 0.9678 | y_found |
+| dyz17 | 838697 | 0.9678 | y_found |
+| dyz2 | 10120853 | 0.9678 | y_found |
 
 ## Run
 
@@ -72,7 +72,7 @@ Before you use `estimate_bp`, read `y_status` and `y_dose`:
 
 - `y_status` = `y_found`: yruler found a Y, and `estimate_bp` is the array length.
 - `y_status` = `no_y`: yruler found no Y (for example, a female), and `estimate_bp` is `NA`. `relative` and `marker_sum_gc` still hold the background counts.
-- `y_dose` = 1: one Y in every cell, as in a typical male. 0.4: a Y in 40% of the cells. 0: no Y. If `y_dose` is below 0.1, or the Y coverage is below 0.5x, the estimates have large errors. yruler does not look for deletions, so `y_dose` = 1 does not mean that the whole Y is present.
+- `y_dose` = 1: one Y in every cell, as in a typical male. 0.4: Y markers at 40% of the male level, for example a Y in 40% of the cells. 0: no Y. If `y_dose` is below 0.1, or the Y coverage is below 0.5x, the estimates have large errors. yruler does not look for deletions, so `y_dose` = 1 does not mean that the whole Y is present.
 
 `model.tsv` is calibrated on PCR-free Illumina 2x150 bp reads from the 1000 Genomes high-coverage project. PCR libraries, other read lengths and other projects shift the values, so compare only samples with the same protocol.
 
