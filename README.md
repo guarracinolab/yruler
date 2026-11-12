@@ -36,6 +36,10 @@ Expected `demo/estimates.tsv` (columns `sample`, `class`, `estimate_bp`, `y_dose
 | dyz17 | 838697 | 0.9678 | y_found |
 | dyz2 | 10120853 | 0.9678 | y_found |
 
+## Citation
+
+Ortigas-Vasquez A. and Guarracino A. Measuring satellite arrays of the human Y chromosome from sequencing reads. bioRxiv (2026). https://doi.org/10.64898/2026.11.04.764422
+
 ## Run
 
 ```bash
