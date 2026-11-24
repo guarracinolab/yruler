@@ -106,7 +106,7 @@ yruler -i R1.fastq.gz,R2.fastq.gz -m data/markers.ms.fa.zst -M model.tsv -o outd
 samtools view -h sample.bam | yruler -i - -m data/markers.ms.fa.zst -M model.tsv -o outdir
 ```
 
-yruler also reads FASTA. Each read counts on its own, so pairs give the same result interleaved or in two files. With an index (`.bai` or `.crai`), yruler reads parts of a BAM or CRAM in parallel. If the file has bases written as `=` (same as the reference), yruler stops and writes no output.
+yruler also reads FASTA. Each read counts on its own, so pairs give the same result interleaved or in two files. With an index (`.bai` or `.crai`), yruler reads parts of a BAM or CRAM in parallel and checks against the index that it read every part (every CRAM slice, and the record count of a BAM read without `-b`): if a download stops early, yruler stops with an error and writes no output. If the file has bases written as `=` (same as the reference), yruler stops and writes no output.
 
 ## Options
 

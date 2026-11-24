@@ -36,6 +36,9 @@ fn kmer_hash(x: u64) -> u64 {
 
 fn die(m: &str) -> ! {
     eprintln!("ERROR yruler: {m}");
+    if let Some(p) = READS.get().filter(|p| std::fs::remove_file(p).is_ok()) {
+        eprintln!("removed the partial {p}");
+    }
     std::process::exit(1)
 }
 // resident and peak memory from /proc (Linux), for the stage log
@@ -1349,7 +1352,73 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
     }
     n
 }
+// read checks of a CRAM from its index (.crai): slice starts (0-based) per reference, and the bounds of the unmapped
+// records from the headers of their containers (a container with placed slices counts only in the upper bound)
+fn crai_expect(input: &str, ntar: usize) -> (Vec<Vec<i64>>, u64, u64) {
+    use rust_htslib::htslib as h;
+    let cs = |s: &str| std::ffi::CString::new(s).unwrap_or_else(|_| die(&format!("{s}: NUL in the name")));
+    let c = input.trim_end_matches(".cram");
+    let (data, ix) = match input.split_once("##idx##") {
+        Some((d, i)) => (d, vec![i.to_string()]),
+        None => (input, vec![format!("{input}.crai"), format!("{c}.crai")]),
+    };
+    let (f, fp) = ix
+        .iter()
+        .filter(|f| f.contains("://") || std::path::Path::new(f).exists())
+        .map(|f| (f, unsafe { h::bgzf_open(cs(f).as_ptr(), c"r".as_ptr()) }))
+        .find(|x| !x.1.is_null())
+        .unwrap_or_else(|| die(&format!("{input}: no CRAM index (tried {})", ix.join(", "))));
+    let (mut txt, mut b) = (Vec::new(), vec![0u8; 1 << 20]);
+    loop {
+        match unsafe { h::bgzf_read(fp, b.as_mut_ptr() as *mut _, b.len()) } {
+            0 => break,
+            k if k < 0 => die(&format!("{f}: read error")),
+            k => txt.extend_from_slice(&b[..k as usize]),
+        }
+    }
+    unsafe { h::bgzf_close(fp) };
+    let (mut st, mut co) = (vec![Vec::new(); ntar], HashMap::<i64, (bool, bool)>::new()); // container: (unmapped, placed)
+    for l in txt.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+        let v: Vec<i64> = std::str::from_utf8(l)
+            .ok()
+            .and_then(|s| s.split('\t').map(|x| x.parse().ok()).collect::<Option<Vec<i64>>>())
+            .filter(|v| v.len() == 6 && v[0] >= -1 && v[0] < ntar as i64)
+            .unwrap_or_else(|| die(&format!("{f}: bad line {}", String::from_utf8_lossy(l))));
+        let e = co.entry(v[3]).or_default();
+        if v[0] < 0 {
+            e.0 = true;
+        } else {
+            e.1 = true;
+            st[v[0] as usize].push(v[1] - 1);
+        }
+    }
+    st.iter_mut().for_each(|v| {
+        v.sort_unstable();
+        v.dedup()
+    });
+    let (mut lo, mut hi) = (0u64, 0u64);
+    let fp = unsafe { h::hts_open(cs(data).as_ptr(), c"r".as_ptr()) };
+    if fp.is_null() {
+        die(&format!("{data}: cannot open"));
+    }
+    for (&o, &(_, p)) in co.iter().filter(|x| x.1 .0) {
+        let c = unsafe {
+            let fd = (*fp).fp.cram;
+            (h::cram_seek(fd, o, h::SEEK_SET as i32) == 0).then(|| h::cram_read_container(fd))
+        }
+        .filter(|c| !c.is_null())
+        .unwrap_or_else(|| die(&format!("{data}: cannot read the container at {o}")));
+        let n = unsafe { h::cram_container_get_num_records(c) } as u64;
+        unsafe { h::cram_free_container(c) };
+        (hi, lo) = (hi + n, if p { lo } else { lo + n });
+    }
+    unsafe { h::hts_close(fp) };
+    eprintln!("read checks: {f}, unmapped records expected {lo}..{hi}");
+    (st, lo, hi)
+}
 // CRAM/BAM: shards (region, previous end on contig) read in parallel, each read once; needs the index
+// a stream that ends early gives no error, only fewer records: every CRAM slice of the index must return its first
+// record and the unmapped records stay within the container bounds; a BAM without -b must match the index counts
 fn read_hts(
     input: &str,
     reference: Option<&str>,
@@ -1383,12 +1452,28 @@ fn read_hts(
         r
     };
     let open = |t: usize| cfg(idx().unwrap_or_else(|e| die(&format!("{input}: {e}"))), t);
-    let h = match idx() {
+    let mut h = match idx() {
         Ok(r) => cfg(r, 1),
         Err(_) if bed.is_none() => return read_seq(input, reference, thr, tx, prx),
         Err(e) => die(&format!("{input}: {e} (-b needs an indexed BAM or CRAM)")),
     };
     let names: Vec<Vec<u8>> = h.header().target_names().iter().map(|n| n.to_vec()).collect();
+    let fmt = unsafe { (*h.htsfile()).format.format };
+    let (sl, ulo, uhi) = if fmt == rust_htslib::htslib::htsExactFormat_cram {
+        crai_expect(input, names.len())
+    } else {
+        (vec![Vec::new(); names.len()], 0, u64::MAX)
+    };
+    let exp: Option<u64> = (fmt == rust_htslib::htslib::htsExactFormat_bam && bed.is_none()).then(|| {
+        h.index_stats()
+            .unwrap_or_else(|e| die(&format!("{input}: index counts: {e}")))
+            .iter()
+            .map(|x| x.2 + x.3)
+            .sum()
+    });
+    if exp.is_none() && fmt != rust_htslib::htslib::htsExactFormat_cram {
+        eprintln!("WARNING no read check: a BAM index has no counts per -b region");
+    }
     let _ = NAMES.set(names.clone());
     gc_bits(reference, &names);
     let rg: Vec<(u32, i64, i64)> = match bed {
@@ -1432,12 +1517,17 @@ fn read_hts(
         AtomicU64::new(0),
         Mutex::new(prx),
     );
+    let (nall, nunm) = (AtomicU64::new(0), AtomicU64::new(0)); // records of any flag, each once; unmapped shard
+    let wn = |i: usize| match sh[i] {
+        Some((t, a, e, _)) => format!("{}:{a}-{e}", String::from_utf8_lossy(&names[t as usize])),
+        None => "unmapped".into(),
+    };
     std::thread::scope(|sc| {
         for _ in 0..nr {
             sc.spawn(|| {
                 let mut r = open(thr / nr);
                 let mut rec = bam::Record::new();
-                let mut n = 0u64;
+                let (mut n, mut na) = (0u64, 0u64);
                 let newbuf = || {
                     prx.lock()
                         .unwrap()
@@ -1451,10 +1541,18 @@ fn read_hts(
                     if i >= sh.len() {
                         break;
                     }
-                    let (t, a, pe) = match sh[i] {
-                        Some((t, a, _, pe)) => (t as i32, a, pe),
-                        None => (-1, i64::MIN, i64::MIN),
+                    let (t, a, e, pe) = match sh[i] {
+                        Some((t, a, e, pe)) => (t as i32, a, e, pe),
+                        None => (-1, i64::MIN, i64::MIN, i64::MIN),
                     };
+                    // CRAM slices that the index places in this shard: each must return its first record
+                    let s: &[i64] = if t >= 0 {
+                        let v = &sl[t as usize];
+                        &v[v.partition_point(|&x| x < a)..v.partition_point(|&x| x < e)]
+                    } else {
+                        &[]
+                    };
+                    let (mut hit, mut ns) = (vec![false; s.len()], 0u64);
                     for k in 1..=6 {
                         // a failed fetch reads no record: reopen and retry (remote files)
                         let x = match sh[i] {
@@ -1462,23 +1560,26 @@ fn read_hts(
                             None => r.fetch(bam::FetchDefinition::Unmapped),
                         };
                         let Err(x) = x else { break };
-                        let w = match sh[i] {
-                            Some((t, a, e, _)) => format!("{}:{a}-{e}", String::from_utf8_lossy(&names[t as usize])),
-                            None => "unmapped".into(),
-                        };
                         if k == 6 {
-                            die(&format!("fetch {w}: {x}"));
+                            die(&format!("fetch {}: {x}", wn(i)));
                         }
-                        eprintln!("WARNING fetch {w}: {x}; retry {k} of 5 in {} s", 10 * k);
+                        eprintln!("WARNING fetch {}: {x}; retry {k} of 5 in {} s", wn(i), 10 * k);
                         std::thread::sleep(std::time::Duration::from_secs(10 * k));
                         r = open(thr / nr);
                     }
                     while let Some(x) = r.read(&mut rec) {
                         x.unwrap_or_else(|e| die(&format!("read {input}: {e}")));
                         let (fl, p) = (rec.flags(), rec.pos());
-                        if fl & 0x900 != 0 || (t >= 0 && p < a && p < pe) {
+                        if let Ok(j) = s.binary_search(&p) {
+                            hit[j] = true;
+                        }
+                        if t >= 0 && p < a && p < pe {
                             continue;
-                        } // secondary/supplementary, or seen in the previous shard
+                        } // seen in the previous shard
+                        ns += 1;
+                        if fl & 0x900 != 0 {
+                            continue;
+                        } // secondary/supplementary
                         pack(&mut buf, &rec);
                         n += 1;
                         if buf.len() >= chunk() {
@@ -1488,16 +1589,41 @@ fn read_hts(
                                 .unwrap();
                         }
                     }
+                    if let Some(j) = hit.iter().position(|&x| !x) {
+                        die(&format!(
+                            "{}: no record at {}, where the CRAM index places a slice: the input ended early, rerun",
+                            wn(i),
+                            s[j] + 1
+                        ));
+                    }
+                    na += ns;
+                    if t < 0 {
+                        nunm.fetch_add(ns, Relaxed);
+                    }
                 }
                 if buf.len() > 1 {
                     tx.send((ci.fetch_add(1, Relaxed), buf)).unwrap();
                 }
                 nrec.fetch_add(n, Relaxed);
+                nall.fetch_add(na, Relaxed);
             });
         }
     });
-    let n = nrec.load(Relaxed);
+    let (n, na, nu) = (nrec.load(Relaxed), nall.load(Relaxed), nunm.load(Relaxed));
     eprintln!("records read (primary) {n}");
+    let why = |low: bool| ["the file and its index disagree", "the input ended early, rerun"][low as usize];
+    if fmt == rust_htslib::htslib::htsExactFormat_cram {
+        if nu < ulo || nu > uhi {
+            die(&format!("unmapped {nu}, CRAM {ulo}..{uhi}: {}", why(nu < ulo)));
+        }
+        eprintln!("read checks passed: every CRAM slice of the index returned records, unmapped {nu}");
+    }
+    if let Some(x) = exp {
+        if na != x {
+            die(&format!("records {na}, BAM index {x}: {}", why(na < x)));
+        }
+        eprintln!("read checks passed: records {na} = BAM index");
+    }
     n
 }
 
