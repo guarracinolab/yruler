@@ -144,6 +144,7 @@ The marker file has one k-mer set per class: the classes above (for `yq12`, all 
 ### Optional output
 
 - `--reads marker_reads.fa`: also write the reads with a marker hit, with the header `contig|bin|MAPQ|flag`. Without it, yruler writes no read sequences, only counts. On controlled-access data, use it only if your data agreement allows it.
+- `--ci`: add the column `count_se_pct` to `estimates.tsv`, the error of each length in % due to chance in which reads were sequenced (20 groups of reads, one left out at a time; groups in `outdir/ci_groups.tsv`). It matters at low coverage and does not include model errors.
 - `--bins 500`: also write `outdir/bins.tsv` with one row per 500 bp bin of the reference that has reads: `contig`, `start`, `reads`, `reads_mq20` (MAPQ 20 or more), `duplicates`, and for each class `<class>_hits`, `<class>_hits_mq20` and `<class>_reads`. It needs aligned input (BAM, CRAM or SAM).
 
 ## License

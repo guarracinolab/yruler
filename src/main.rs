@@ -428,6 +428,7 @@ struct Local {
     cmiss: u64,
     bpos: u64,
     cache: Vec<Ent>,
+    ci: Vec<u64>, // --ci: hits per (read group, class)
 }
 // per-thread cache of recent k-mers (sorted input: a k-mer comes back in the next reads); counts added to the table on eviction
 #[derive(Clone, Copy)]
@@ -530,6 +531,7 @@ fn count_read(
     seq: &[u8],
     qual: &[u8],
     rep: u64,   // --gc-curve: how many times the read counts
+    frag: u32,  // --ci: fragment name hash
 ) {
     let (w, b, mq) = (3 + 3 * c.ncl, pos.saturating_sub(1) / c.bin, mapq >= 20); // pos is 1-based
     let ri = if c.last.1 == b && c.last.0 == rname {
@@ -664,6 +666,10 @@ fn count_read(
     if (fl >> 10) & 1 == 1 {
         rec[2] += rep;
     }
+    if !loc.ci.is_empty() {
+        let g = frag as usize % CI_GROUPS * c.ncl;
+        loc.ci[g..g + c.ncl].iter_mut().zip(h.iter()).for_each(|(x, y)| *x += y);
+    }
     let mut any = false;
     for j in 0..c.ncl {
         if h[j] > 0 {
@@ -701,7 +707,7 @@ fn work(chunk: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut V
         }
         let mut q = 0;
         let it = &mut q;
-        field(line, it);
+        let frag = frag_hash(field(line, it));
         let fl = parse_u64(field(line, it));
         let rname = field(line, it);
         let pos = parse_u64(field(line, it));
@@ -723,7 +729,7 @@ fn work(chunk: &[u8], loc: &mut Local, c: &mut Ctx, fa: &mut Vec<u8>, kb: &mut V
         } else {
             vec![]
         };
-        count_read(c, loc, fa, kb, rname, pos, mapq, fl, seq, &qv, 1);   // SAM text: no --gc-curve weight (main checks)
+        count_read(c, loc, fa, kb, rname, pos, mapq, fl, seq, &qv, 1, frag);   // SAM text: no --gc-curve weight (main checks)
     }
 }
 // binary chunk (first byte 0xFF): flag u16, tid i32, pos i64, mapq u8, l_seq u32, 4-bit seq
@@ -771,6 +777,12 @@ fn work_bin(
                 writeln!(d.lock().unwrap(), "{tid}\t{pos}\t{fl}\t{tlen}\t{rep}").unwrap_or_else(|e| die(&format!("YRULER_GC_DUMP: {e}")));
             }
         }
+        let frag = if CI.load(Relaxed) {
+            p += 4;
+            u32::from_le_bytes(ch[p - 4..p].try_into().unwrap())
+        } else {
+            0
+        };
         if rep > 0 {
             count_read(
                 c,
@@ -784,6 +796,7 @@ fn work_bin(
                 sq,
                 qs,
                 rep,
+                frag,
             );
         }
     }
@@ -975,6 +988,14 @@ static QUAL: std::sync::OnceLock<(u8, Vec<i64>)> = std::sync::OnceLock::new(); /
 // every hit adds round(weight x GC_SCALE), so all counts are GC_SCALE times the weighted count (summary header gc_weight_scale)
 const GC_SCALE: u64 = 4096; // weight error <= 0.5 / 4096; 3 x 4096 per hit keeps a 66,139-hit marker (HG00126 30x) at 8.1e8, under u32 4.29e9
 static GCW: std::sync::OnceLock<(Vec<f64>, f64)> = std::sync::OnceLock::new(); // weight per GC bin (201), fragment length cap
+static CI: AtomicBool = AtomicBool::new(false); // --ci: hits per class in CI_GROUPS read groups, for a jackknife standard error
+const CI_GROUPS: usize = 20;
+// read group of a fragment: FNV-1a of the read name without /1 or /2, so mates share a group
+fn frag_hash(q: &[u8]) -> u32 {
+    let q = q.strip_suffix(b"/1").or_else(|| q.strip_suffix(b"/2")).unwrap_or(q);
+    let h = q.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    (h ^ (h >> 32)) as u32
+}
 static GCON: AtomicBool = AtomicBool::new(false); // --gc-curve given: packed records carry mate contig, TLEN and reference span
 static GCREF: std::sync::OnceLock<Vec<Vec<u64>>> = std::sync::OnceLock::new(); // G or C bit per reference base, by header contig index
 // YRULER_GC_DUMP=<file>: one line per read (contig index, 1-based position, flag, TLEN, weight x GC_SCALE), to check the weights
@@ -1246,6 +1267,9 @@ fn pack(buf: &mut Vec<u8>, rec: &rust_htslib::bam::Record) {
         buf.extend_from_slice(&(rec.insert_size() as i32).to_le_bytes());
         buf.extend_from_slice(&span.to_le_bytes());
     }
+    if CI.load(Relaxed) {
+        buf.extend_from_slice(&frag_hash(rec.qname()).to_le_bytes());
+    }
 }
 // SAM/BAM/CRAM without index, FASTQ/FASTA (plain or gzip), list a,b: one reader per file, start to end
 fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
@@ -1298,7 +1322,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
                 && h::hts_set_opt(
                     fp,
                     h::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-                    0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 } | gc_fields(),
+                    0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 } | gc_fields() | if CI.load(Relaxed) { 0x1 } else { 0 },
                 ) != 0
             {
                 eprintln!("WARNING {f}: cram required fields not set");
@@ -1445,7 +1469,7 @@ fn read_hts(
             .unwrap_or_else(|e| die(&format!("threads: {e}")));
         if let Err(e) = r.set_cram_options(
             rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-            0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 } | gc_fields(),
+            0x2 | 0x4 | 0x8 | 0x10 | 0x200 | if QUAL.get().is_some() { 0x400 } else { 0 } | gc_fields() | if CI.load(Relaxed) { 0x1 } else { 0 },
         ) {
             eprintln!("WARNING cram required fields: {e}");
         }
@@ -1715,6 +1739,7 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, threads: us
                     hits: 0,
                     cmiss: 0,
                     bpos: 0,
+                    ci: if CI.load(Relaxed) { vec![0; CI_GROUPS * ncl] } else { vec![] },
                     cache: vec![
                         Ent {
                             key: EMPTY,
@@ -1976,6 +2001,21 @@ fn count(src: Src, fa_path: &str, name: &str, bin: u64, wbins: bool, threads: us
         } // full sum_gc: estimate reads it back
         o.flush().unwrap();
     }
+    if CI.load(Relaxed) {
+        let mut g = vec![0u64; CI_GROUPS * ncl];
+        locs.iter().for_each(|l| g.iter_mut().zip(&l.ci).for_each(|(x, y)| *x += y));
+        let mut o = wr("ci_groups.tsv");
+        writeln!(o, "group\t{}", markers.names.join("\t")).unwrap();
+        for k in 0..CI_GROUPS {
+            writeln!(o, "{k}\t{}", g[k * ncl..(k + 1) * ncl].iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")).unwrap();
+        }
+        for (j, c) in markers.names.iter().enumerate() {
+            let (t, s) = ((0..CI_GROUPS).map(|k| g[k * ncl + j]).sum::<u64>(), counts_by_class[j].iter().sum::<u64>());
+            if t != s {
+                die(&format!("--ci: class {c}: read groups sum to {t}, class sum {s}"));
+            }
+        }
+    }
     eprintln!(
         "y_dose {:?} ysinglecopy_depth {:?} depth_mean {:?} (median of {} denominator classes); total {:.1} s; {}",
         2.0 * ruler_mean / depth_mean,
@@ -2101,9 +2141,35 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
     };
     let relative = |c: &str| by_class[c].1 / ruler_sum;
     let estimate_bp = |c: &str| k(c) * relative(c);
+    // --ci: ci_groups.tsv next to summary.tsv. Leaving read group g out scales each class by 1 - its hits in g / its hits, the ruler too
+    let ci_path = std::path::Path::new(summary).with_file_name("ci_groups.tsv");
+    let ci: Option<(Vec<String>, Vec<Vec<f64>>)> = ci_path.exists().then(|| {
+        let t = read(ci_path.to_str().unwrap());
+        let mut l = t.lines().map(|r| r.split('\t').skip(1));
+        let head: Vec<String> = l.next().unwrap_or_else(|| die("ci_groups.tsv empty")).map(String::from).collect();
+        let g: Vec<Vec<f64>> = l.map(|r| r.map(|v| v.parse().unwrap_or_else(|_| die(&format!("ci_groups.tsv {v}")))).collect()).collect();
+        (head, g)
+    });
+    let se = |terms: &str| -> Option<f64> {
+        let (head, g) = ci.as_ref()?;
+        let col = |c: &str| head.iter().position(|h| h == c).unwrap_or_else(|| die(&format!("ci_groups.tsv: no class {c}")));
+        let keep = |r: &[f64], j: usize| 1.0 - r[j] / g.iter().map(|x| x[j]).sum::<f64>().max(1.0);
+        let th: Vec<f64> = g
+            .iter()
+            .map(|r| {
+                terms.split('+').filter(|t| !t.is_empty()).map(|t| match t.strip_prefix('-') {
+                    Some(n) => -estimate_bp(n) * keep(r, col(n)),
+                    None => estimate_bp(t) * keep(r, col(t)),
+                }).sum::<f64>() / keep(r, col("ysinglecopy"))
+            })
+            .collect();
+        let (n, m) = (th.len() as f64, th.iter().sum::<f64>() / th.len() as f64);
+        Some(((n - 1.0) / n * th.iter().map(|x| (x - m).powi(2)).sum::<f64>()).sqrt())
+    };
     writeln!(
         out,
-        "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms"
+        "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms{}",
+        if ci.is_some() { "\tcount_se_pct" } else { "" }
     )
     .unwrap();
     for (class, terms) in &reported {
@@ -2116,6 +2182,7 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
             })
             .sum();
         let (sample, sum_gc) = by_class[class.as_str()];
+        let sep = se(terms).map_or(String::new(), |v| if bp > 0.0 && ruler_sum > 0.0 && y_found { format!("\t{:.3}", 100.0 * v / bp) } else { "\tNA".into() });
         let shown = terms.replace("+-", "-");
         let na = !(ruler_sum > 0.0);
         let bp = if na || !y_found { "NA".to_string() } else { format!("{bp:.0}") }; // no_y: no length (relative and marker_sum_gc kept)
@@ -2126,7 +2193,7 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
         };
         writeln!(
             out,
-            "{sample}\t{class}\t{bp}\t{rel}\t{gc}\t{ruler_sum:.0}\t{y_dose}\t{y_status}\t{shown}"
+            "{sample}\t{class}\t{bp}\t{rel}\t{gc}\t{ruler_sum:.0}\t{y_dose}\t{y_status}\t{shown}{sep}"
         )
         .unwrap();
     }
@@ -2137,12 +2204,13 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
 }
 
 const USAGE: &str = "usage:
-  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>] [--reads <file>]
+  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>] [--reads <file>] [--ci]
   yruler estimate <summary.tsv> <model.tsv> [-x <tech>]
 -i -: SAM on stdin; -i a,b: files read one after the other (FASTQ: plain or gzip, interleaved pairs in one file or R1,R2)
 -x: illumina (default), hifi, ont, hic (experimental); the model needs K values for that technology (the released model.tsv: illumina)
 --bins <bp>: also write bins.tsv, reads and marker hits per <bp> of the reference (aligned input)
---reads <file>: also write the sequences of the reads with a marker hit (off by default)";
+--reads <file>: also write the sequences of the reads with a marker hit (off by default)
+--ci: also write ci_groups.tsv and, with -M, the column count_se_pct (standard error from read sampling, %)";
 // --gc-curve <file> --gc-frag <bp> (not in the usage, experimental): weight every read by min(3, 1 / bias(fragment GC)) from a Teitz 2018 GC curve (aligned input, needs -r)
 fn tech(t: &str) -> &'static str {
     TECH.iter()
@@ -2189,6 +2257,11 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         let k = args[i].as_str();
+        if k == "--ci" {
+            CI.store(true, Relaxed);
+            i += 1;
+            continue;
+        }
         if !matches!(
             k,
             "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads" | "--gc-curve" | "--gc-frag"
@@ -2284,6 +2357,23 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ci_mates_and_jackknife() {
+        // mates share a read group; 2 planted groups: leaving each out gives 120 and 80 bp around 100, SE 20%
+        assert_eq!(super::frag_hash(b"r7/1"), super::frag_hash(b"r7/2"));
+        assert_eq!(super::frag_hash(b"r7/1"), super::frag_hash(b"r7"));
+        assert_ne!(super::frag_hash(b"r7"), super::frag_hash(b"r8"));
+        let d = std::env::temp_dir().join(format!("yruler_ci_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, m) = (d.join("summary.tsv"), d.join("m.tsv"));
+        std::fs::write(&s, "#y_dose=1.0\nsample\tnreads\tclass\tn_kmers\tsum\tmedian\tfrac_zero\tsum_gc\nx\t1\ta\t1\t10\t1\t0\t10.0\nx\t1\tysinglecopy\t1\t100\t1\t0\t100.0\n").unwrap();
+        std::fs::write(d.join("ci_groups.tsv"), "group\ta\tysinglecopy\n0\t4\t50\n1\t6\t50\n").unwrap();
+        std::fs::write(&m, "class\tK\ttech\tlength\na\t1000\tillumina\ta\n").unwrap();
+        let mut o = vec![];
+        super::estimate(s.to_str().unwrap(), m.to_str().unwrap(), "illumina", &mut o);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(String::from_utf8(o).unwrap(), "sample\tclass\testimate_bp\trelative\tmarker_sum_gc\tysinglecopy_sum\ty_dose\ty_status\tterms\tcount_se_pct\nx\ta\t100\t0.1\t10.0\t100\t1.0000\ty_found\ta\t20.000\n");
+    }
     #[test]
     fn masked_superstring() {
         // uppercase starts a k-mer; header name before '_'
