@@ -2234,14 +2234,69 @@ fn estimate(summary: &str, model: &str, x: &str, out: &mut dyn Write) {
     );
 }
 
+// --nearest: rank the assemblies of the table by how well their copies explain the sample counts. Per class, Poisson
+// log-likelihood sum_k x_k ln c_k - X ln sum_k c_k (c = copies + 0.5): the scale is fitted per assembly and class, so array length
+// does not count. Table: "#assembly" and the names, then class, 31-mer and the copies in each assembly
+fn nearest(counts: &str, table: &str, out: &mut dyn Write) {
+    use std::io::BufRead;
+    let raw = std::fs::read(table).unwrap_or_else(|e| die(&format!("{table}: {e}")));
+    let raw = if table.ends_with(".zst") { zstd::stream::decode_all(&raw[..]).unwrap_or_else(|e| die(&format!("{table}: zstd {e}"))) } else { raw };
+    let txt = String::from_utf8(raw).unwrap_or_else(|_| die(&format!("{table}: not text")));
+    let mut ln = txt.lines();
+    let asm: Vec<&str> = ln.next().and_then(|h| h.strip_prefix("#assembly\t")).unwrap_or_else(|| die(&format!("{table}: first line must be #assembly and the names"))).split('\t').collect();
+    let (mut cls, mut key, mut cp) = (vec![], HashMap::new(), vec![]);
+    for l in ln {
+        let f: Vec<&str> = l.split('\t').collect();
+        let k = f.get(1).and_then(|s| canon(s.as_bytes())).filter(|_| f.len() == asm.len() + 2).unwrap_or_else(|| die(&format!("{table}: bad line {l}")));
+        if key.insert(k, cp.len()).is_some() {
+            die(&format!("{table}: {} twice", f[1]));
+        }
+        cls.push(f[0]);
+        cp.push(f[2..].iter().map(|v| v.parse::<f64>().map_or_else(|_| die(&format!("{table}: bad copies in {l}")), |c| c + 0.5)).collect::<Vec<f64>>());
+    }
+    let mut x = vec![f64::NAN; cp.len()];
+    for l in io::BufReader::new(std::fs::File::open(counts).unwrap_or_else(|e| die(&format!("{counts}: {e}")))).lines() {
+        let l = l.unwrap_or_else(|e| die(&format!("{counts}: {e}")));
+        if let Some((i, n)) = l.split_once('\t').and_then(|(k, n)| Some((*key.get(&canon(k.as_bytes())?)?, n))) {
+            x[i] = n.parse().unwrap_or_else(|_| die(&format!("{counts}: bad count in {l}")));
+        }
+    }
+    let miss = x.iter().filter(|v| v.is_nan()).count();
+    if miss > 0 {
+        die(&format!("{counts}: {miss} of {} table 31-mers have no count (markers and table differ)", x.len()));
+    }
+    if x.iter().sum::<f64>() == 0.0 {
+        die("--nearest: no hits on the table 31-mers (no Y arrays in the reads)");
+    }
+    let (mut ll, mut tot) = (vec![0f64; asm.len()], HashMap::new());
+    for (i, c) in cls.iter().enumerate() {
+        let t = tot.entry(*c).or_insert_with(|| (0f64, vec![0f64; asm.len()]));
+        t.0 += x[i];
+        for a in 0..asm.len() {
+            ll[a] += x[i] * cp[i][a].ln();
+            t.1[a] += cp[i][a];
+        }
+    }
+    for (xs, s) in tot.values() {
+        ll.iter_mut().zip(s).for_each(|(l, s)| *l -= xs * s.ln());
+    }
+    let mut o: Vec<usize> = (0..asm.len()).collect();
+    o.sort_by(|&a, &b| ll[b].total_cmp(&ll[a]));
+    writeln!(out, "rank\tassembly\tlog_likelihood_gap").unwrap();
+    for (r, &a) in o.iter().take(3).enumerate() {
+        writeln!(out, "{}\t{}\t{:.1}", r + 1, asm[a], ll[a] - ll[o[0]]).unwrap();
+    }
+    eprintln!("nearest: {} table 31-mers in {} classes, {} assemblies, hits {}", x.len(), tot.len(), asm.len(), x.iter().sum::<f64>());
+}
 const USAGE: &str = "usage:
-  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>] [--reads <file>] [--ci]
+  yruler -i <cram|bam|sam|fastq|fasta|-> -m <markers> -o <outdir> [-r <ref.fa>] [-b <regions.bed>] [-M <model.tsv>] [-x <tech>] [-n <name>] [-t <threads>] [--bins <bp>] [--reads <file>] [--ci] [--nearest <table>]
   yruler estimate <summary.tsv> <model.tsv> [-x <tech>]
 -i -: SAM on stdin; -i a,b: files read one after the other (FASTQ: plain or gzip, interleaved pairs in one file or R1,R2)
 -x: illumina (default), hifi, ont, hic (experimental); the model needs K values for that technology (the released model.tsv: illumina)
 --bins <bp>: also write bins.tsv, reads and marker hits per <bp> of the reference (aligned input)
 --reads <file>: also write the sequences of the reads with a marker hit (off by default)
---ci: also write ci_groups.tsv and, with -M, the column count_se_pct (standard error from read sampling, %)";
+--ci: also write ci_groups.tsv and, with -M, the column count_se_pct (standard error from read sampling, %)
+--nearest <table>: also write nearest.tsv, the 3 assembled Y chromosomes most similar to the sample in satellite sequence (table: data/nearest_y.tsv.zst; Illumina reads)";
 // --gc-curve <file> --gc-frag <bp> (not in the usage, experimental): weight every read by min(3, 1 / bias(fragment GC)) from a Teitz 2018 GC curve (aligned input, needs -r)
 fn tech(t: &str) -> &'static str {
     TECH.iter()
@@ -2295,7 +2350,7 @@ fn main() {
         }
         if !matches!(
             k,
-            "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads" | "--gc-curve" | "--gc-frag"
+            "-i" | "-m" | "-o" | "-r" | "-b" | "-M" | "-x" | "-n" | "-t" | "--bins" | "--reads" | "--gc-curve" | "--gc-frag" | "--nearest"
         ) {
             die(&format!("unknown option {k}\n{USAGE}"));
         }
@@ -2319,6 +2374,11 @@ fn main() {
         });
     if threads == 0 {
         die("-t: use at least 1 thread");
+    }
+    if let Some(t) = opts.get("--nearest") {
+        if technology != "illumina" || !std::path::Path::new(t).is_file() {
+            die(&format!("--nearest {t}: needs the table file and Illumina reads (-x illumina)"));
+        }
     }
     if let Some(p) = opts.get("--reads") {
         READS.set(p.clone()).unwrap();
@@ -2384,10 +2444,31 @@ fn main() {
         w.flush().unwrap();
         print!("{}", std::fs::read_to_string(&p).unwrap());
     }
+    if let Some(t) = opts.get("--nearest") {
+        let p = format!("{out}/nearest.tsv");
+        let mut w = BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}"))));
+        nearest(&format!("{out}/counts.tsv"), t, &mut w);
+        w.flush().unwrap();
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nearest_shape_per_class() {
+        // c1 counts match A; c2 counts match all three, A with 10 times the copies; expected values by hand
+        // (normalizing over both classes together would rank B first)
+        let d = std::env::temp_dir().join(format!("yruler_nearest_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (t, c) = (d.join("t.tsv"), d.join("counts.tsv"));
+        let k = |s: &str| format!("{}{s}", "A".repeat(31 - s.len()));
+        std::fs::write(&t, format!("#assembly\tB\tA\tC\nc1\t{}\t50\t9\t1\nc1\t{}\t50\t1\t9\nc2\t{}\t2\t20\t2\nc2\t{}\t2\t20\t2\n", k("C"), k("G"), k("CA"), k("GA"))).unwrap();
+        std::fs::write(&c, format!("{}\t90\n{}\t10\n{}\t5\n{}\t5\n{}\t7\n", k("C"), k("G"), k("CA"), k("GA"), k("CC"))).unwrap();
+        let mut o = vec![];
+        super::nearest(c.to_str().unwrap(), t.to_str().unwrap(), &mut o);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(String::from_utf8(o).unwrap(), "rank\tassembly\tlog_likelihood_gap\n1\tA\t0.0\n2\tB\t-36.2\n3\tC\t-147.7\n");
+    }
     #[test]
     fn ci_mates_and_jackknife() {
         // mates share a read group; 2 planted groups: leaving each out gives 120 and 80 bp around 100, SE 20%
