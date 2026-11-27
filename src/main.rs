@@ -1272,7 +1272,8 @@ fn pack(buf: &mut Vec<u8>, rec: &rust_htslib::bam::Record) {
     }
 }
 // SAM/BAM/CRAM without index, FASTQ/FASTA (plain or gzip), list a,b: one reader per file, start to end
-fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>) -> u64 {
+// unm: a whole CRAM whose index returns too few unmapped records (read_hts), with their bounds from the containers
+fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc::Receiver<Vec<u8>>, unm: Option<(u64, u64)>) -> u64 {
     use rust_htslib::{bam, htslib as h};
     let cs = |s: &str| std::ffi::CString::new(s).unwrap_or_else(|_| die(&format!("{s}: NUL in the name")));
     let newbuf = || {
@@ -1306,7 +1307,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
                 "{f}: {kind} has no read positions; --bins needs SAM, BAM or CRAM input"
             ));
         }
-        if matches!(kind, "BAM" | "CRAM") {
+        if matches!(kind, "BAM" | "CRAM") && unm.is_none() {
             eprintln!("WARNING {f}: no index: one reader, start to end (slower)");
         }
         unsafe {
@@ -1343,7 +1344,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
             die(&format!("{f}: contigs differ from the first input"));
         }
         gc_bits(reference, &names);
-        let mut m = 0u64;
+        let (mut m, mut u) = (0u64, 0u64);
         loop {
             let r = unsafe { h::sam_read1(fp, hd, rec.inner_mut()) };
             if r == -1 {
@@ -1352,6 +1353,7 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
             if r < -1 {
                 die(&format!("read {f}: htslib error {r}"));
             }
+            u += (rec.tid() < 0) as u64;
             if rec.flags() & 0x900 != 0 {
                 continue;
             } // secondary/supplementary
@@ -1369,6 +1371,12 @@ fn read_seq(input: &str, reference: Option<&str>, thr: usize, tx: Tx, prx: mpsc:
             h::hts_close(fp);
         }
         eprintln!("{f}: {kind}, records read (primary, one reader) {m}");
+        if let Some((lo, hi)) = unm {
+            if u < lo || u > hi {
+                die(&format!("unmapped {u}, CRAM {lo}..{hi}: the file and its index disagree"));
+            }
+            eprintln!("read checks passed: unmapped {u}, CRAM {lo}..{hi}");
+        }
         n += m;
     }
     if buf.len() > 1 {
@@ -1478,7 +1486,7 @@ fn read_hts(
     let open = |t: usize| cfg(idx().unwrap_or_else(|e| die(&format!("{input}: {e}"))), t);
     let mut h = match idx() {
         Ok(r) => cfg(r, 1),
-        Err(_) if bed.is_none() => return read_seq(input, reference, thr, tx, prx),
+        Err(_) if bed.is_none() => return read_seq(input, reference, thr, tx, prx, None),
         Err(e) => die(&format!("{input}: {e} (-b needs an indexed BAM or CRAM)")),
     };
     let names: Vec<Vec<u8>> = h.header().target_names().iter().map(|n| n.to_vec()).collect();
@@ -1488,6 +1496,29 @@ fn read_hts(
     } else {
         (vec![Vec::new(); names.len()], 0, u64::MAX)
     };
+    // CRAM: count first the unmapped records that the index returns; some indexes return fewer than the containers
+    // hold (an SGDP CRAM: 9,496 of 10,469,496), then the whole file is read start to end instead
+    if fmt == rust_htslib::htslib::htsExactFormat_cram {
+        let mut u = open(thr);
+        if let Err(e) = u.set_cram_options(rust_htslib::htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS, 0x2) {
+            eprintln!("WARNING cram required fields: {e}");
+        }
+        u.fetch(bam::FetchDefinition::Unmapped)
+            .unwrap_or_else(|e| die(&format!("fetch unmapped: {e}")));
+        let (mut k, mut rec) = (0u64, bam::Record::new());
+        while let Some(x) = u.read(&mut rec) {
+            x.unwrap_or_else(|e| die(&format!("read {input}: {e}")));
+            k += 1;
+        }
+        if k < ulo {
+            let m = format!("{input}: the index returns {k} unmapped records, the CRAM containers hold {ulo}..{uhi}");
+            if bed.is_some() {
+                die(&format!("{m}: rerun without -b (yruler then reads the whole file start to end)"));
+            }
+            eprintln!("{m}: reading the whole file start to end, without the index");
+            return read_seq(input, reference, thr, tx, prx, Some((ulo, uhi)));
+        }
+    }
     let exp: Option<u64> = (fmt == rust_htslib::htslib::htsExactFormat_bam && bed.is_none()).then(|| {
         h.index_stats()
             .unwrap_or_else(|e| die(&format!("{input}: index counts: {e}")))
